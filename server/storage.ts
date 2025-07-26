@@ -14,6 +14,7 @@ import {
 } from "@shared/schema";
 import { db } from "./db";
 import { eq, and, desc, asc, gte, lte, inArray } from "drizzle-orm";
+import { randomUUID } from 'crypto';
 
 export interface IStorage {
   // User methods
@@ -102,7 +103,7 @@ export class DatabaseStorage implements IStorage {
 
   async getSprintsByNumbers(userId: string, sprintNumbers: number[]): Promise<Sprint[]> {
     if (sprintNumbers.length === 0) return [];
-    
+
     return db
       .select()
       .from(sprints)

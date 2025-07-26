@@ -7,12 +7,12 @@ import { updateSprintCommitmentsSchema } from "@shared/schema";
 import { z } from "zod";
 
 export async function registerRoutes(app: Express): Promise<Server> {
-  
+
   // Get dashboard data for a user
   app.get("/api/dashboard/:username", async (req, res) => {
     try {
       const { username } = req.params;
-      
+
       // Get or create user
       let user = await storage.getUserByUsername(username);
       if (!user) {
@@ -33,10 +33,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Create missing sprints
       const missingSprintNumbers = allSprintNumbers.filter(num => !existingSprintNumbers.has(num));
-      
+
       for (const sprintNumber of missingSprintNumbers) {
         const sprintInfo = SprintCalculator.getSprintInfo(sprintNumber);
-        
+
         // Set initial state for sprints
         let type: "build" | "test" | "pto" | null = null;
         let description: string | null = null;
@@ -61,10 +61,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Get all sprints with updated data
       const allSprints = await storage.getUserSprints(user.id);
-      
+
       // Get sprint commitments
       const sprintCommitments = await storage.getSprintCommitments(user.id);
-      
+
       // Organize data
       const historicSprints = allSprints.filter(s => s.status === "historic");
       const currentSprint = allSprints.find(s => s.status === "current");
@@ -162,7 +162,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           user.username,
           newCommitments
         );
-        
+
         console.log(`Sent ${webhookResults.sent} webhooks, ${webhookResults.failed} failed`);
       }
 
@@ -170,7 +170,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const allSprints = await storage.getUserSprints(user.id);
       const futureSprints = allSprints.filter(s => s.status === "future");
       const futureCommittedSprints = futureSprints.filter(s => s.type);
-      
+
       const buildCount = futureCommittedSprints.filter(s => s.type === "build").length;
       const ptoCount = futureCommittedSprints.filter(s => s.type === "pto").length;
       const isValid = buildCount >= 2 && ptoCount <= 2;
@@ -200,7 +200,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const authHeader = req.headers.authorization;
       const expectedToken = process.env.SPRINT_TRANSITION_TOKEN || "default-token";
-      
+
       if (!authHeader || authHeader !== `Bearer ${expectedToken}`) {
         return res.status(401).json({ message: "Unauthorized" });
       }
@@ -208,18 +208,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Get all users
       // Note: In a production system, you'd probably want to process users in batches
       const users = await storage.getUserByUsername("*"); // This would need to be implemented differently
-      
+
       // For now, we'll just update sprint statuses based on current date
       const currentSprintNumber = SprintCalculator.getCurrentSprintNumber();
-      
+
       console.log(`Advancing to sprint ${currentSprintNumber}`);
-      
+
       // This would involve:
       // 1. Moving current sprints to historic
       // 2. Moving first future sprint to current
       // 3. Adding new future sprint
       // 4. Updating all sprint statuses
-      
+
       res.json({
         success: true,
         message: "Sprint transition completed",
@@ -235,14 +235,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/dashboard/:username/complete", async (req, res) => {
     try {
       const { username } = req.params;
-      
+
       const user = await storage.getUserByUsername(username);
       if (!user) {
         return res.status(404).json({ message: "User not found" });
       }
 
       await WebhookService.sendDashboardCompletionWebhook(user.id, user.username);
-      
+
       res.json({ success: true, message: "Dashboard completion webhook sent" });
     } catch (error) {
       console.error("Error sending completion webhook:", error);
