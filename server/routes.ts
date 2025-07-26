@@ -214,17 +214,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const currentSprintNumber = SprintCalculator.getCurrentSprintNumber();
 
       console.log(`Starting sprint transition to sprint ${currentSprintNumber}`);
-      
+
       // Get all users to process their sprints
       const allUsers = await storage.getAllUsers();
       let totalSprintsProcessed = 0;
       let usersProcessed = 0;
+      let failedUsers: Array<{ username: string; error: string }> = [];
 
       for (const user of allUsers) {
         try {
           // Get user's existing sprints
           const userSprints = await storage.getUserSprints(user.id);
-          
+
           // Prepare transaction operations
           const statusUpdates: Array<{ sprintId: string; status: "historic" | "current" | "future" }> = [];
           const newSprints: Array<{
@@ -240,7 +241,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           // Collect sprint status updates
           for (const sprint of userSprints) {
             const sprintInfo = SprintCalculator.getSprintInfo(sprint.sprintNumber);
-            
+
             if (sprint.status !== sprintInfo.status) {
               statusUpdates.push({
                 sprintId: sprint.id,
@@ -258,7 +259,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           ];
 
           const missingSprintNumbers = allRequiredSprints.filter(num => !existingSprintNumbers.has(num));
-          
+
           for (const sprintNumber of missingSprintNumbers) {
             const sprintInfo = SprintCalculator.getSprintInfo(sprintNumber);
             newSprints.push({
@@ -275,31 +276,44 @@ export async function registerRoutes(app: Express): Promise<Server> {
           const historicSprints = userSprints
             .filter(s => s.status === 'historic')
             .sort((a, b) => a.sprintNumber - b.sprintNumber);
-          
+
           if (historicSprints.length > 24) {
             const sprintsToRemove = historicSprints.slice(0, historicSprints.length - 24);
             sprintsToDelete.push(...sprintsToRemove.map(s => s.id));
           }
 
-          // Execute all operations in a single transaction
+          // Execute all operations in a single transaction with automatic rollback on failure
           if (statusUpdates.length > 0 || newSprints.length > 0 || sprintsToDelete.length > 0) {
             await storage.executeSprintTransition(user.id, {
               statusUpdates,
               newSprints,
               sprintsToDelete
             });
-            
+
             totalSprintsProcessed += statusUpdates.length + newSprints.length + sprintsToDelete.length;
+            console.log(`Successfully processed user ${user.username}: ${statusUpdates.length} updates, ${newSprints.length} new sprints, ${sprintsToDelete.length} deletions`);
           }
 
           usersProcessed++;
         } catch (userError) {
-          console.error(`Error processing user ${user.username}:`, userError);
+          const errorMessage = userError instanceof Error ? userError.message : "Unknown error";
+          console.error(`Transaction failed for user ${user.username}:`, userError);
+
+          failedUsers.push({
+            username: user.username,
+            error: errorMessage
+          });
+
           // Continue processing other users even if one fails
+          // The transaction will have automatically rolled back
         }
       }
 
       console.log(`Sprint transition completed: ${usersProcessed} users processed, ${totalSprintsProcessed} sprint updates made`);
+
+      if (failedUsers.length > 0) {
+        console.log(`The following users had errors: ${JSON.stringify(failedUsers)}`);
+      }
 
       res.json({
         success: true,
@@ -308,6 +322,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         usersProcessed,
         sprintUpdates: totalSprintsProcessed,
         timestamp: new Date().toISOString(),
+        failedUsers,
       });
     } catch (error) {
       console.error("Error advancing sprint:", error);

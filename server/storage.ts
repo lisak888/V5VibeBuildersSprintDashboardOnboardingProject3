@@ -224,6 +224,102 @@ export class DatabaseStorage implements IStorage {
   async executeTransaction<T>(fn: TransactionFn<T>): Promise<T> {
     return await db.transaction(fn);
   }
+
+  // Transaction-based sprint transition operations
+  async executeSprintTransition(
+    userId: string, 
+    operations: {
+      statusUpdates: Array<{ sprintId: string; status: "historic" | "current" | "future" }>;
+      newSprints: Array<{
+        sprintNumber: number;
+        startDate: Date;
+        endDate: Date;
+        type: "build" | "test" | "pto" | null;
+        description: string | null;
+        status: "historic" | "current" | "future";
+      }>;
+      sprintsToDelete: string[];
+    }
+  ): Promise<void> {
+    await db.transaction(async (tx) => {
+      // Apply status updates
+      for (const update of operations.statusUpdates) {
+        await tx
+          .update(sprints)
+          .set({ status: update.status, updatedAt: new Date() })
+          .where(eq(sprints.id, update.sprintId));
+      }
+
+      // Create new sprints
+      for (const newSprint of operations.newSprints) {
+        await tx
+          .insert(sprints)
+          .values({
+            userId,
+            sprintNumber: newSprint.sprintNumber,
+            startDate: newSprint.startDate,
+            endDate: newSprint.endDate,
+            type: newSprint.type,
+            description: newSprint.description,
+            status: newSprint.status,
+          });
+      }
+
+      // Delete old sprints and their commitments
+      for (const sprintId of operations.sprintsToDelete) {
+        // Delete related commitments first
+        await tx
+          .delete(sprintCommitments)
+          .where(eq(sprintCommitments.sprintId, sprintId));
+        
+        // Then delete the sprint
+        await tx
+          .delete(sprints)
+          .where(eq(sprints.id, sprintId));
+      }
+    });
+  }
+
+  // Transaction-based commitment updates
+  async executeCommitmentUpdate(
+    userId: string,
+    commitmentUpdates: Array<{
+      sprintId: string;
+      type: "build" | "test" | "pto" | null;
+      description: string | null;
+    }>,
+    newCommitmentData: Array<{
+      sprintId: string;
+      type: "build" | "test" | "pto";
+      description: string | null;
+    }>
+  ): Promise<void> {
+    await db.transaction(async (tx) => {
+      // Update sprint data
+      for (const update of commitmentUpdates) {
+        await tx
+          .update(sprints)
+          .set({
+            type: update.type,
+            description: update.description,
+            updatedAt: new Date(),
+          })
+          .where(eq(sprints.id, update.sprintId));
+      }
+
+      // Create sprint commitment records for new commitments
+      for (const commitment of newCommitmentData) {
+        await tx
+          .insert(sprintCommitments)
+          .values({
+            userId,
+            sprintId: commitment.sprintId,
+            type: commitment.type,
+            description: commitment.description,
+          });
+      }
+    });
+  }
 }
 
 export const storage = new DatabaseStorage();
