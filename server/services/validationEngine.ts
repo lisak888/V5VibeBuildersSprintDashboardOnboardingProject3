@@ -1,4 +1,3 @@
-
 /**
  * Validation Engine - Centralized sprint commitment validation for Vibe Builders Dashboard
  * 
@@ -57,10 +56,10 @@ export class ValidationError extends Error {
 export class ValidationEngine {
   /** Maximum PTO sprints allowed in rolling window */
   private static readonly MAX_PTO_SPRINTS = 2;
-  
+
   /** Minimum Build sprints required in rolling window */
   private static readonly MIN_BUILD_SPRINTS = 2;
-  
+
   /** Default rolling window size (6 sprints) */
   private static readonly DEFAULT_ROLLING_WINDOW = 6;
 
@@ -138,9 +137,9 @@ export class ValidationEngine {
    */
   static validatePTOMaximum(commitments: SprintCommitmentData[]): ValidationResult {
     const errors: string[] = [];
-    
+
     const ptoCount = commitments.filter(c => c.type === "pto").length;
-    
+
     if (ptoCount > this.MAX_PTO_SPRINTS) {
       errors.push(
         `Maximum ${this.MAX_PTO_SPRINTS} PTO sprints allowed per ${commitments.length}-sprint window. Found ${ptoCount} PTO commitments.`
@@ -159,9 +158,9 @@ export class ValidationEngine {
    */
   static validateBuildMinimum(commitments: SprintCommitmentData[]): ValidationResult {
     const errors: string[] = [];
-    
+
     const buildCount = commitments.filter(c => c.type === "build").length;
-    
+
     if (buildCount < this.MIN_BUILD_SPRINTS) {
       errors.push(
         `Minimum ${this.MIN_BUILD_SPRINTS} Build sprints required per ${commitments.length}-sprint window. Found ${buildCount} Build commitments.`
@@ -180,7 +179,7 @@ export class ValidationEngine {
    */
   static validateBuildDescriptions(commitments: SprintCommitmentData[]): ValidationResult {
     const errors: string[] = [];
-    
+
     const buildSprints = commitments.filter(c => c.type === "build");
     const buildSprintsWithoutDescription = buildSprints.filter(c => 
       !c.description || c.description.trim() === ""
@@ -205,7 +204,7 @@ export class ValidationEngine {
   static validateCommitmentTypes(commitments: SprintCommitmentData[]): ValidationResult {
     const errors: string[] = [];
     const validTypes = ["build", "test", "pto", null];
-    
+
     const invalidCommitments = commitments.filter(c => 
       c.type !== null && !validTypes.includes(c.type)
     );
@@ -258,12 +257,12 @@ export class ValidationEngine {
    */
   static generateWarnings(commitments: SprintCommitmentData[]): string[] {
     const warnings: string[] = [];
-    
+
     // Check for uncommitted future sprints
     const uncommittedCount = commitments.filter(c => 
       c.status === "future" && c.type === null
     ).length;
-    
+
     if (uncommittedCount > 0) {
       warnings.push(
         `${uncommittedCount} future sprint(s) remain uncommitted.`
@@ -274,7 +273,7 @@ export class ValidationEngine {
     const buildCount = commitments.filter(c => c.type === "build").length;
     const testCount = commitments.filter(c => c.type === "test").length;
     const ptoCount = commitments.filter(c => c.type === "pto").length;
-    
+
     if (buildCount > testCount + ptoCount) {
       warnings.push(
         "Consider balancing Build sprints with Test or PTO sprints for sustainable workload."
@@ -330,7 +329,7 @@ export class ValidationEngine {
     existingCommitments: SprintCommitmentData[]
   ): ValidationResult {
     const errors: string[] = [];
-    
+
     // Validate Build description requirement
     if (commitment.type === "build" && (!commitment.description || commitment.description.trim() === "")) {
       errors.push("Build sprints require a description");
@@ -385,7 +384,7 @@ export class ValidationEngine {
     const uncommittedCount = rollingWindowCommitments.filter(c => c.type === null).length;
 
     const validation = this.validateSprintCommitments(context);
-    
+
     // Filter critical errors (those that prevent form submission)
     const criticalErrors = validation.errors.filter(error => 
       error.includes("Maximum") || 
@@ -401,5 +400,68 @@ export class ValidationEngine {
       isValid: validation.isValid,
       criticalErrors
     };
+  }
+
+  /**
+   * Debug method to visualize the rolling window calculation
+   * Useful for testing and understanding how the window is constructed
+   * 
+   * @param commitments - All sprint commitments
+   * @returns Human-readable description of the rolling window
+   */
+  static debugRollingWindow(commitments: SprintCommitmentData[]): string {
+    const analysis = this.analyzeRollingWindow(commitments);
+    const { windowCommitments, windowBoundaries, statusDistribution, typeDistribution } = analysis;
+
+    let debug = `Rolling Window Analysis (6-Sprint Window)\n`;
+    debug += `=====================================\n`;
+    debug += `Window Range: Sprint ${windowBoundaries.startSprintNumber} to ${windowBoundaries.endSprintNumber}\n`;
+    debug += `Total Sprints: ${windowBoundaries.totalSprints}\n\n`;
+
+    debug += `Status Distribution:\n`;
+    debug += `- Current: ${statusDistribution.current}\n`;
+    debug += `- Future: ${statusDistribution.future}\n\n`;
+
+    debug += `Commitment Distribution:\n`;
+    debug += `- Build: ${typeDistribution.build}\n`;
+    debug += `- Test: ${typeDistribution.test}\n`;
+    debug += `- PTO: ${typeDistribution.pto}\n`;
+    debug += `- Uncommitted: ${typeDistribution.uncommitted}\n\n`;
+
+    debug += `Sprint Details:\n`;
+    windowCommitments.forEach((commitment, index) => {
+      debug += `${index + 1}. Sprint ${commitment.sprintNumber} (${commitment.status}): ${commitment.type || 'uncommitted'}\n`;
+    });
+
+    debug += `\nValidation Status:\n`;
+    debug += `- Meets minimum Build (≥2): ${analysis.validationMetrics.meetsMinimumBuild}\n`;
+    debug += `- Exceeds maximum PTO (>2): ${analysis.validationMetrics.exceedsMaximumPTO}\n`;
+    debug += `- Has uncommitted sprints: ${analysis.validationMetrics.hasUncommittedSprints}\n`;
+
+    return debug;
+  }
+
+  /**
+   * Test if a specific sprint number falls within the current rolling window
+   * 
+   * @param sprintNumber - Sprint number to test
+   * @param commitments - All sprint commitments
+   * @returns True if the sprint is within the rolling window
+   */
+  static isSprintInRollingWindow(sprintNumber: number, commitments: SprintCommitmentData[]): boolean {
+    const windowCommitments = this.calculate6SprintRollingWindow(commitments);
+    return windowCommitments.some(c => c.sprintNumber === sprintNumber);
+  }
+
+  /**
+   * Get the position of a sprint within the rolling window (0-5)
+   * 
+   * @param sprintNumber - Sprint number to find
+   * @param commitments - All sprint commitments  
+   * @returns Position in window (0-5) or -1 if not in window
+   */
+  static getSprintPositionInWindow(sprintNumber: number, commitments: SprintCommitmentData[]): number {
+    const windowCommitments = this.calculate6SprintRollingWindow(commitments);
+    return windowCommitments.findIndex(c => c.sprintNumber === sprintNumber);
   }
 }
