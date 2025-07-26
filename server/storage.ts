@@ -871,13 +871,663 @@ export class DatabaseStorage implements IStorage {
     }
   }
 
+  // ===== CONCURRENCY CONTROL MECHANISMS =====
+  // Phase 5 Task 10: Build concurrency control mechanisms
+
+  private readonly lockManager = new Map<string, {
+    queue: Array<{
+      resolve: (value: any) => void;
+      reject: (error: Error) => void;
+      timeout: NodeJS.Timeout;
+      operationType: string;
+      timestamp: Date;
+    }>;
+    isLocked: boolean;
+    lockHolder?: string;
+    lockAcquiredAt?: Date;
+    lockTimeout?: NodeJS.Timeout;
+  }>();
+
+  private readonly operationSemaphores = new Map<string, {
+    current: number;
+    max: number;
+    queue: Array<{
+      resolve: () => void;
+      reject: (error: Error) => void;
+      timeout: NodeJS.Timeout;
+      operationType: string;
+    }>;
+  }>();
+
+  /**
+   * Acquire an exclusive lock for a specific resource
+   * Prevents concurrent modifications to critical data
+   */
+  async acquireExclusiveLock(
+    resourceId: string,
+    operationType: string,
+    options: {
+      timeout?: number;
+      maxWaitTime?: number;
+      priority?: 'high' | 'normal' | 'low';
+    } = {}
+  ): Promise<{ lockId: string; release: () => Promise<void> }> {
+    const {
+      timeout = 30000,
+      maxWaitTime = 60000,
+      priority = 'normal'
+    } = options;
+
+    const lockId = `${operationType}_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+    
+    if (!this.lockManager.has(resourceId)) {
+      this.lockManager.set(resourceId, {
+        queue: [],
+        isLocked: false
+      });
+    }
+
+    const lockInfo = this.lockManager.get(resourceId)!;
+
+    // If not locked, acquire immediately
+    if (!lockInfo.isLocked) {
+      lockInfo.isLocked = true;
+      lockInfo.lockHolder = lockId;
+      lockInfo.lockAcquiredAt = new Date();
+
+      // Set automatic timeout for the lock
+      lockInfo.lockTimeout = setTimeout(() => {
+        console.warn(`[CONCURRENCY] Lock ${lockId} timed out for resource ${resourceId}`);
+        this.releaseLock(resourceId, lockId);
+      }, timeout);
+
+      return {
+        lockId,
+        release: () => this.releaseLock(resourceId, lockId)
+      };
+    }
+
+    // Wait for lock to be available
+    return new Promise((resolve, reject) => {
+      const waitTimeout = setTimeout(() => {
+        // Remove from queue
+        const index = lockInfo.queue.findIndex(q => q.resolve === resolve);
+        if (index >= 0) {
+          lockInfo.queue.splice(index, 1);
+        }
+        reject(new Error(`Lock acquisition timeout for resource ${resourceId} after ${maxWaitTime}ms`));
+      }, maxWaitTime);
+
+      const queueItem = {
+        resolve: (lockData: any) => {
+          clearTimeout(waitTimeout);
+          resolve(lockData);
+        },
+        reject: (error: Error) => {
+          clearTimeout(waitTimeout);
+          reject(error);
+        },
+        timeout: waitTimeout,
+        operationType,
+        timestamp: new Date()
+      };
+
+      // Insert based on priority
+      if (priority === 'high') {
+        lockInfo.queue.unshift(queueItem);
+      } else {
+        lockInfo.queue.push(queueItem);
+      }
+    });
+  }
+
+  /**
+   * Release an exclusive lock
+   */
+  private async releaseLock(resourceId: string, lockId: string): Promise<void> {
+    const lockInfo = this.lockManager.get(resourceId);
+    if (!lockInfo || lockInfo.lockHolder !== lockId) {
+      return; // Lock not held by this caller
+    }
+
+    // Clear timeout
+    if (lockInfo.lockTimeout) {
+      clearTimeout(lockInfo.lockTimeout);
+      lockInfo.lockTimeout = undefined;
+    }
+
+    lockInfo.isLocked = false;
+    lockInfo.lockHolder = undefined;
+    lockInfo.lockAcquiredAt = undefined;
+
+    // Process next in queue
+    if (lockInfo.queue.length > 0) {
+      const nextWaiter = lockInfo.queue.shift()!;
+      
+      lockInfo.isLocked = true;
+      const nextLockId = `${nextWaiter.operationType}_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+      lockInfo.lockHolder = nextLockId;
+      lockInfo.lockAcquiredAt = new Date();
+
+      // Set timeout for next lock holder
+      lockInfo.lockTimeout = setTimeout(() => {
+        console.warn(`[CONCURRENCY] Lock ${nextLockId} timed out for resource ${resourceId}`);
+        this.releaseLock(resourceId, nextLockId);
+      }, 30000);
+
+      nextWaiter.resolve({
+        lockId: nextLockId,
+        release: () => this.releaseLock(resourceId, nextLockId)
+      });
+    }
+  }
+
+  /**
+   * Acquire a semaphore for rate-limited operations
+   * Controls the number of concurrent operations of a specific type
+   */
+  async acquireSemaphore(
+    operationType: string,
+    maxConcurrent: number = 5,
+    options: {
+      timeout?: number;
+      priority?: 'high' | 'normal' | 'low';
+    } = {}
+  ): Promise<{ release: () => void }> {
+    const { timeout = 30000, priority = 'normal' } = options;
+
+    if (!this.operationSemaphores.has(operationType)) {
+      this.operationSemaphores.set(operationType, {
+        current: 0,
+        max: maxConcurrent,
+        queue: []
+      });
+    }
+
+    const semaphore = this.operationSemaphores.get(operationType)!;
+
+    // If under limit, acquire immediately
+    if (semaphore.current < semaphore.max) {
+      semaphore.current++;
+      
+      return {
+        release: () => {
+          semaphore.current--;
+          this.processNextSemaphoreWaiter(operationType);
+        }
+      };
+    }
+
+    // Wait for availability
+    return new Promise((resolve, reject) => {
+      const waitTimeout = setTimeout(() => {
+        // Remove from queue
+        const index = semaphore.queue.findIndex(q => q.resolve === resolve);
+        if (index >= 0) {
+          semaphore.queue.splice(index, 1);
+        }
+        reject(new Error(`Semaphore acquisition timeout for ${operationType} after ${timeout}ms`));
+      }, timeout);
+
+      const queueItem = {
+        resolve: (semaphoreData: any) => {
+          clearTimeout(waitTimeout);
+          resolve(semaphoreData);
+        },
+        reject: (error: Error) => {
+          clearTimeout(waitTimeout);
+          reject(error);
+        },
+        timeout: waitTimeout,
+        operationType
+      };
+
+      // Insert based on priority
+      if (priority === 'high') {
+        semaphore.queue.unshift(queueItem);
+      } else {
+        semaphore.queue.push(queueItem);
+      }
+    });
+  }
+
+  /**
+   * Process next semaphore waiter
+   */
+  private processNextSemaphoreWaiter(operationType: string): void {
+    const semaphore = this.operationSemaphores.get(operationType);
+    if (!semaphore || semaphore.queue.length === 0 || semaphore.current >= semaphore.max) {
+      return;
+    }
+
+    const nextWaiter = semaphore.queue.shift()!;
+    semaphore.current++;
+
+    nextWaiter.resolve({
+      release: () => {
+        semaphore.current--;
+        this.processNextSemaphoreWaiter(operationType);
+      }
+    });
+  }
+
+  /**
+   * Execute operation with exclusive lock protection
+   * Prevents concurrent access to critical resources
+   */
+  async executeWithExclusiveLock<T>(
+    resourceId: string,
+    operationType: string,
+    operation: () => Promise<T>,
+    options: {
+      lockTimeout?: number;
+      maxWaitTime?: number;
+      priority?: 'high' | 'normal' | 'low';
+    } = {}
+  ): Promise<T> {
+    const lock = await this.acquireExclusiveLock(resourceId, operationType, options);
+    
+    try {
+      return await operation();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  /**
+   * Execute operation with semaphore rate limiting
+   * Controls concurrent operations of the same type
+   */
+  async executeWithSemaphore<T>(
+    operationType: string,
+    operation: () => Promise<T>,
+    maxConcurrent: number = 5,
+    options: {
+      timeout?: number;
+      priority?: 'high' | 'normal' | 'low';
+    } = {}
+  ): Promise<T> {
+    const semaphore = await this.acquireSemaphore(operationType, maxConcurrent, options);
+    
+    try {
+      return await operation();
+    } finally {
+      semaphore.release();
+    }
+  }
+
+  /**
+   * Deadlock detection and prevention
+   * Monitors lock acquisition patterns to prevent deadlocks
+   */
+  private readonly lockDependencyGraph = new Map<string, Set<string>>();
+  private readonly lockWaitGraph = new Map<string, Set<string>>();
+
+  private detectPotentialDeadlock(requesterId: string, resourceId: string): boolean {
+    // Build dependency graph
+    const visited = new Set<string>();
+    const recursionStack = new Set<string>();
+
+    const hasCycle = (node: string): boolean => {
+      if (recursionStack.has(node)) {
+        return true; // Cycle detected
+      }
+      if (visited.has(node)) {
+        return false;
+      }
+
+      visited.add(node);
+      recursionStack.add(node);
+
+      const dependencies = this.lockDependencyGraph.get(node) || new Set();
+      for (const dependency of dependencies) {
+        if (hasCycle(dependency)) {
+          return true;
+        }
+      }
+
+      recursionStack.delete(node);
+      return false;
+    };
+
+    // Add potential dependency
+    if (!this.lockDependencyGraph.has(requesterId)) {
+      this.lockDependencyGraph.set(requesterId, new Set());
+    }
+    this.lockDependencyGraph.get(requesterId)!.add(resourceId);
+
+    // Check for cycles
+    const deadlockDetected = hasCycle(requesterId);
+
+    // Remove the potential dependency if it would cause deadlock
+    if (deadlockDetected) {
+      this.lockDependencyGraph.get(requesterId)!.delete(resourceId);
+    }
+
+    return deadlockDetected;
+  }
+
+  /**
+   * Enhanced transaction execution with concurrency control
+   * Combines transactions with lock management for critical operations
+   */
+  async executeTransactionWithConcurrencyControl<T>(
+    operationType: OperationContext['operationType'],
+    operation: TransactionFn<T>,
+    userId?: string,
+    options: TransactionOptions & {
+      exclusiveLockResource?: string;
+      semaphoreLimit?: number;
+      priority?: 'high' | 'normal' | 'low';
+      preventDeadlock?: boolean;
+    } = {}
+  ): Promise<TransactionResult<T> & { 
+    concurrencyStats: {
+      lockWaitTime: number;
+      semaphoreWaitTime: number;
+      deadlockPrevented: boolean;
+    }
+  }> {
+    const {
+      exclusiveLockResource,
+      semaphoreLimit = 3,
+      priority = 'normal',
+      preventDeadlock = true,
+      ...transactionOptions
+    } = options;
+
+    const concurrencyStats = {
+      lockWaitTime: 0,
+      semaphoreWaitTime: 0,
+      deadlockPrevented: false
+    };
+
+    const operationId = `${operationType}_${userId || 'system'}_${Date.now()}`;
+
+    try {
+      // Deadlock prevention
+      if (preventDeadlock && exclusiveLockResource) {
+        const deadlockDetected = this.detectPotentialDeadlock(operationId, exclusiveLockResource);
+        if (deadlockDetected) {
+          concurrencyStats.deadlockPrevented = true;
+          throw new Error(`Potential deadlock detected for operation ${operationId} on resource ${exclusiveLockResource}`);
+        }
+      }
+
+      // Acquire semaphore for operation type
+      const semaphoreStart = Date.now();
+      const semaphore = await this.acquireSemaphore(operationType, semaphoreLimit, { priority });
+      concurrencyStats.semaphoreWaitTime = Date.now() - semaphoreStart;
+
+      try {
+        // Acquire exclusive lock if needed
+        let lock: { release: () => Promise<void> } | undefined;
+        if (exclusiveLockResource) {
+          const lockStart = Date.now();
+          const lockResult = await this.acquireExclusiveLock(exclusiveLockResource, operationType, { priority });
+          lock = lockResult;
+          concurrencyStats.lockWaitTime = Date.now() - lockStart;
+        }
+
+        try {
+          // Execute transaction
+          const result = await this.executeTransactionWithRecovery(
+            operationType,
+            operation,
+            userId,
+            {
+              ...transactionOptions,
+              enableRecovery: true,
+              validateAfterRecovery: true
+            }
+          );
+
+          return {
+            ...result,
+            concurrencyStats
+          };
+        } finally {
+          // Release exclusive lock
+          if (lock) {
+            await lock.release();
+          }
+        }
+      } finally {
+        // Release semaphore
+        semaphore.release();
+      }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error : new Error(String(error)),
+        duration: 0,
+        retryCount: 0,
+        concurrencyStats
+      };
+    } finally {
+      // Clean up dependency graph
+      if (exclusiveLockResource) {
+        this.lockDependencyGraph.delete(operationId);
+      }
+    }
+  }
+
+  /**
+   * Batch operation with intelligent concurrency control
+   * Processes multiple operations with optimal concurrency management
+   */
+  async executeConcurrentBatchOperations<T>(
+    operations: Array<{
+      id: string;
+      type: string;
+      operation: () => Promise<T>;
+      priority?: 'high' | 'normal' | 'low';
+      resourceDependencies?: string[];
+    }>,
+    options: {
+      maxConcurrency?: number;
+      batchSize?: number;
+      failFast?: boolean;
+      deadlockPrevention?: boolean;
+    } = {}
+  ): Promise<{
+    results: Array<{ id: string; success: boolean; data?: T; error?: string }>;
+    stats: {
+      totalProcessed: number;
+      successful: number;
+      failed: number;
+      avgExecutionTime: number;
+      totalWaitTime: number;
+      deadlocksPrevented: number;
+    };
+  }> {
+    const {
+      maxConcurrency = 5,
+      batchSize = 10,
+      failFast = false,
+      deadlockPrevention = true
+    } = options;
+
+    const results: Array<{ id: string; success: boolean; data?: T; error?: string }> = [];
+    const stats = {
+      totalProcessed: 0,
+      successful: 0,
+      failed: 0,
+      avgExecutionTime: 0,
+      totalWaitTime: 0,
+      deadlocksPrevented: 0
+    };
+
+    const executionTimes: number[] = [];
+    let totalWaitTime = 0;
+
+    // Process operations in batches
+    for (let i = 0; i < operations.length; i += batchSize) {
+      const batch = operations.slice(i, i + batchSize);
+      
+      // Execute batch with controlled concurrency
+      const batchPromises = batch.map(async (op) => {
+        const startTime = Date.now();
+        
+        try {
+          // Deadlock prevention check
+          if (deadlockPrevention && op.resourceDependencies) {
+            for (const resource of op.resourceDependencies) {
+              const deadlockDetected = this.detectPotentialDeadlock(op.id, resource);
+              if (deadlockDetected) {
+                stats.deadlocksPrevented++;
+                throw new Error(`Deadlock prevented for operation ${op.id}`);
+              }
+            }
+          }
+
+          // Execute with semaphore control
+          const result = await this.executeWithSemaphore(
+            op.type,
+            op.operation,
+            maxConcurrency,
+            { priority: op.priority || 'normal' }
+          );
+
+          const executionTime = Date.now() - startTime;
+          executionTimes.push(executionTime);
+
+          return {
+            id: op.id,
+            success: true,
+            data: result
+          };
+        } catch (error) {
+          const executionTime = Date.now() - startTime;
+          executionTimes.push(executionTime);
+
+          return {
+            id: op.id,
+            success: false,
+            error: error instanceof Error ? error.message : String(error)
+          };
+        }
+      });
+
+      // Wait for batch completion
+      const batchResults = await Promise.all(batchPromises);
+      results.push(...batchResults);
+
+      // Update stats
+      stats.totalProcessed += batchResults.length;
+      stats.successful += batchResults.filter(r => r.success).length;
+      stats.failed += batchResults.filter(r => !r.success).length;
+
+      // Fail fast if requested
+      if (failFast && batchResults.some(r => !r.success)) {
+        break;
+      }
+    }
+
+    // Calculate final stats
+    stats.avgExecutionTime = executionTimes.length > 0 
+      ? executionTimes.reduce((a, b) => a + b, 0) / executionTimes.length 
+      : 0;
+    stats.totalWaitTime = totalWaitTime;
+
+    return { results, stats };
+  }
+
+  /**
+   * Monitor and report concurrency system health
+   */
+  getConcurrencySystemStats(): {
+    activeLocks: number;
+    queuedLockRequests: number;
+    activeSemaphores: number;
+    queuedSemaphoreRequests: number;
+    lockDetails: Array<{
+      resourceId: string;
+      lockHolder: string;
+      acquiredAt: Date;
+      queueLength: number;
+    }>;
+    semaphoreDetails: Array<{
+      operationType: string;
+      currentUsage: number;
+      maxCapacity: number;
+      queueLength: number;
+    }>;
+  } {
+    const lockDetails = Array.from(this.lockManager.entries()).map(([resourceId, info]) => ({
+      resourceId,
+      lockHolder: info.lockHolder || 'none',
+      acquiredAt: info.lockAcquiredAt || new Date(),
+      queueLength: info.queue.length
+    }));
+
+    const semaphoreDetails = Array.from(this.operationSemaphores.entries()).map(([operationType, info]) => ({
+      operationType,
+      currentUsage: info.current,
+      maxCapacity: info.max,
+      queueLength: info.queue.length
+    }));
+
+    return {
+      activeLocks: Array.from(this.lockManager.values()).filter(info => info.isLocked).length,
+      queuedLockRequests: Array.from(this.lockManager.values()).reduce((sum, info) => sum + info.queue.length, 0),
+      activeSemaphores: this.operationSemaphores.size,
+      queuedSemaphoreRequests: Array.from(this.operationSemaphores.values()).reduce((sum, info) => sum + info.queue.length, 0),
+      lockDetails,
+      semaphoreDetails
+    };
+  }
+
+  /**
+   * Clean up stale locks and semaphores
+   * Prevents resource leaks and stuck operations
+   */
+  async cleanupConcurrencyResources(): Promise<{
+    staleLocksCleaned: number;
+    staleSemaphoresCleaned: number;
+  }> {
+    let staleLocksCleaned = 0;
+    let staleSemaphoresCleaned = 0;
+    const now = Date.now();
+    const staleThreshold = 5 * 60 * 1000; // 5 minutes
+
+    // Clean up stale locks
+    for (const [resourceId, lockInfo] of this.lockManager.entries()) {
+      if (lockInfo.isLocked && lockInfo.lockAcquiredAt) {
+        const lockAge = now - lockInfo.lockAcquiredAt.getTime();
+        if (lockAge > staleThreshold) {
+          console.warn(`[CONCURRENCY] Cleaning up stale lock for resource ${resourceId}, age: ${lockAge}ms`);
+          await this.releaseLock(resourceId, lockInfo.lockHolder!);
+          staleLocksCleaned++;
+        }
+      }
+
+      // Clean up empty lock managers
+      if (!lockInfo.isLocked && lockInfo.queue.length === 0) {
+        this.lockManager.delete(resourceId);
+      }
+    }
+
+    // Clean up empty semaphores
+    for (const [operationType, semaphoreInfo] of this.operationSemaphores.entries()) {
+      if (semaphoreInfo.current === 0 && semaphoreInfo.queue.length === 0) {
+        this.operationSemaphores.delete(operationType);
+        staleSemaphoresCleaned++;
+      }
+    }
+
+    return { staleLocksCleaned, staleSemaphoresCleaned };
+  }
+
   // ===== ROLLBACK AND ERROR RECOVERY LOGIC =====
   // Phase 5 Task 9: Add rollback and error recovery logic
 
-  /**
-   * Error classification and recovery strategy interface
-   */
-  interface ErrorRecoveryStrategy {
+  }
+
+/**
+ * Error classification and recovery strategy interface
+ */
+interface ErrorRecoveryStrategy {
     shouldRetry: boolean;
     retryDelay: number;
     maxRetries: number;
@@ -887,9 +1537,9 @@ export class DatabaseStorage implements IStorage {
   }
 
   /**
-   * Operation context for comprehensive error tracking
-   */
-  interface OperationContext {
+ * Operation context for comprehensive error tracking
+ */
+interface OperationContext {
     operationType: 'sprint_advancement' | 'commitment_update' | 'bulk_operation' | 'data_migration';
     userId?: string;
     operationId: string;
@@ -1472,6 +2122,269 @@ export class DatabaseStorage implements IStorage {
       ...result.data!,
       recoveryAttempts: result.recoveryAttempts,
       rollbackPerformed: result.rollbackPerformed
+    };
+  }
+
+  /**
+   * Concurrency-controlled sprint advancement for single user
+   * Uses exclusive locks to prevent conflicting sprint operations
+   */
+  async executeSprintAdvancementWithConcurrencyControl(
+    userId: string,
+    operations: {
+      currentSprintNumber: number;
+      sprintStatusMap: Map<number, "historic" | "current" | "future">;
+      newSprintsToCreate: Array<{
+        sprintNumber: number;
+        startDate: Date;
+        endDate: Date;
+        status: "historic" | "current" | "future";
+      }>;
+      sprintsToCleanup: number[];
+    }
+  ): Promise<{
+    success: boolean;
+    sprintsUpdated: number;
+    sprintsCreated: number;
+    sprintsDeleted: number;
+    concurrencyStats: {
+      lockWaitTime: number;
+      semaphoreWaitTime: number;
+      deadlockPrevented: boolean;
+    };
+    error?: string;
+  }> {
+    const result = await this.executeTransactionWithConcurrencyControl(
+      'sprint_advancement',
+      async (tx) => {
+        return await this.performAtomicSprintAdvancementOperations(tx, userId, operations);
+      },
+      userId,
+      {
+        exclusiveLockResource: `user_sprints_${userId}`,
+        semaphoreLimit: 2, // Max 2 concurrent sprint advancements
+        priority: 'high',
+        preventDeadlock: true,
+        enableRecovery: true,
+        validateAfterRecovery: true,
+        createBackup: true,
+        retries: 3,
+        isolationLevel: 'repeatable read',
+        timeout: 45000
+      }
+    );
+
+    if (!result.success) {
+      return {
+        success: false,
+        sprintsUpdated: 0,
+        sprintsCreated: 0,
+        sprintsDeleted: 0,
+        concurrencyStats: result.concurrencyStats,
+        error: result.error?.message || 'Unknown error'
+      };
+    }
+
+    return {
+      success: true,
+      ...result.data!,
+      concurrencyStats: result.concurrencyStats
+    };
+  }
+
+  /**
+   * Concurrency-controlled commitment updates
+   * Prevents race conditions during commitment modifications
+   */
+  async executeCommitmentUpdateWithConcurrencyControl(
+    userId: string,
+    commitmentUpdates: Array<{
+      sprintId: string;
+      type: "build" | "test" | "pto" | null;
+      description: string | null;
+    }>,
+    newCommitmentData: Array<{
+      sprintId: string;
+      type: "build" | "test" | "pto";
+      description: string | null;
+    }>
+  ): Promise<{
+    success: boolean;
+    updatedSprints: number;
+    newCommitments: number;
+    concurrencyStats: {
+      lockWaitTime: number;
+      semaphoreWaitTime: number;
+      deadlockPrevented: boolean;
+    };
+    error?: string;
+  }> {
+    const result = await this.executeTransactionWithConcurrencyControl(
+      'commitment_update',
+      async (tx) => {
+        // Update sprint data
+        for (const update of commitmentUpdates) {
+          await tx
+            .update(sprints)
+            .set({
+              type: update.type,
+              description: update.description,
+              updatedAt: new Date(),
+            })
+            .where(eq(sprints.id, update.sprintId));
+        }
+
+        // Create sprint commitment records for new commitments
+        for (const commitment of newCommitmentData) {
+          await tx
+            .insert(sprintCommitments)
+            .values({
+              userId,
+              sprintId: commitment.sprintId,
+              type: commitment.type,
+              description: commitment.description,
+            });
+        }
+
+        return {
+          updatedSprints: commitmentUpdates.length,
+          newCommitments: newCommitmentData.length
+        };
+      },
+      userId,
+      {
+        exclusiveLockResource: `user_commitments_${userId}`,
+        semaphoreLimit: 5, // Max 5 concurrent commitment updates
+        priority: 'normal',
+        preventDeadlock: true,
+        enableRecovery: true,
+        validateAfterRecovery: true,
+        retries: 2,
+        isolationLevel: 'read committed',
+        timeout: 30000
+      }
+    );
+
+    if (!result.success) {
+      return {
+        success: false,
+        updatedSprints: 0,
+        newCommitments: 0,
+        concurrencyStats: result.concurrencyStats,
+        error: result.error?.message || 'Unknown error'
+      };
+    }
+
+    return {
+      success: true,
+      ...result.data!,
+      concurrencyStats: result.concurrencyStats
+    };
+  }
+
+  /**
+   * Global sprint advancement with intelligent concurrency control
+   * Processes all users with optimal resource utilization
+   */
+  async executeGlobalSprintAdvancementWithConcurrency(
+    userOperations: Array<{
+      userId: string;
+      username: string;
+      operations: {
+        currentSprintNumber: number;
+        sprintStatusMap: Map<number, "historic" | "current" | "future">;
+        newSprintsToCreate: Array<{
+          sprintNumber: number;
+          startDate: Date;
+          endDate: Date;
+          status: "historic" | "current" | "future";
+        }>;
+        sprintsToCleanup: number[];
+      };
+    }>
+  ): Promise<{
+    totalUsersProcessed: number;
+    totalSprintsUpdated: number;
+    totalSprintsCreated: number;
+    totalSprintsDeleted: number;
+    failedUsers: Array<{ username: string; error: string }>;
+    processingTimeMs: number;
+    concurrencyStats: {
+      avgLockWaitTime: number;
+      avgSemaphoreWaitTime: number;
+      deadlocksPrevented: number;
+    };
+  }> {
+    const startTime = Date.now();
+    
+    // Convert user operations to batch operations format
+    const batchOperations = userOperations.map(userOp => ({
+      id: userOp.userId,
+      type: 'sprint_advancement',
+      operation: async () => {
+        return await this.executeSprintAdvancementWithConcurrencyControl(
+          userOp.userId,
+          userOp.operations
+        );
+      },
+      priority: 'high' as const,
+      resourceDependencies: [`user_sprints_${userOp.userId}`]
+    }));
+
+    // Execute with controlled concurrency
+    const batchResult = await this.executeConcurrentBatchOperations(
+      batchOperations,
+      {
+        maxConcurrency: 3, // Limit concurrent sprint advancements
+        batchSize: 5,      // Process in small batches
+        failFast: false,   // Continue processing even if some fail
+        deadlockPrevention: true
+      }
+    );
+
+    // Aggregate results
+    let totalSprintsUpdated = 0;
+    let totalSprintsCreated = 0;
+    let totalSprintsDeleted = 0;
+    let totalLockWaitTime = 0;
+    let totalSemaphoreWaitTime = 0;
+    let deadlocksPrevented = 0;
+
+    const failedUsers: Array<{ username: string; error: string }> = [];
+
+    for (const result of batchResult.results) {
+      if (result.success && result.data) {
+        totalSprintsUpdated += result.data.sprintsUpdated;
+        totalSprintsCreated += result.data.sprintsCreated;
+        totalSprintsDeleted += result.data.sprintsDeleted;
+        totalLockWaitTime += result.data.concurrencyStats.lockWaitTime;
+        totalSemaphoreWaitTime += result.data.concurrencyStats.semaphoreWaitTime;
+        if (result.data.concurrencyStats.deadlockPrevented) {
+          deadlocksPrevented++;
+        }
+      } else {
+        const userOp = userOperations.find(u => u.userId === result.id);
+        failedUsers.push({
+          username: userOp?.username || 'unknown',
+          error: result.error || 'Unknown error'
+        });
+      }
+    }
+
+    const successfulOperations = batchResult.results.filter(r => r.success).length;
+
+    return {
+      totalUsersProcessed: successfulOperations,
+      totalSprintsUpdated,
+      totalSprintsCreated,
+      totalSprintsDeleted,
+      failedUsers,
+      processingTimeMs: Date.now() - startTime,
+      concurrencyStats: {
+        avgLockWaitTime: successfulOperations > 0 ? totalLockWaitTime / successfulOperations : 0,
+        avgSemaphoreWaitTime: successfulOperations > 0 ? totalSemaphoreWaitTime / successfulOperations : 0,
+        deadlocksPrevented: deadlocksPrevented + batchResult.stats.deadlocksPrevented
+      }
     };
   }
 
