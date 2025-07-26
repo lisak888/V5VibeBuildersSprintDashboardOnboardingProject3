@@ -11,6 +11,9 @@ export const users = pgTable("users", {
 }, (table) => ({
   // Index for username-based authentication queries (already has unique constraint but explicit index for clarity)
   usernameIdx: index("idx_users_username").on(table.username),
+  // Constraints
+  usernameNotEmpty: sql`CHECK (length(trim(username)) > 0)`,
+  passwordNotEmpty: sql`CHECK (length(password) >= 8)`,
 }));
 
 export const sprints = pgTable("sprints", {
@@ -33,6 +36,14 @@ export const sprints = pgTable("sprints", {
   startDateIdx: index("idx_sprints_start_date").on(table.startDate),
   // Index for status transitions
   statusIdx: index("idx_sprints_status").on(table.status),
+  // Constraints
+  validSprintType: sql`CHECK (type IS NULL OR type IN ('build', 'test', 'pto'))`,
+  validStatus: sql`CHECK (status IN ('historic', 'current', 'future'))`,
+  validSprintNumber: sql`CHECK (sprint_number >= 0)`,
+  validDateRange: sql`CHECK (end_date > start_date)`,
+  buildDescriptionRequired: sql`CHECK (type != 'build' OR (type = 'build' AND description IS NOT NULL AND length(trim(description)) > 0))`,
+  // Unique constraint: one sprint per user per sprint number
+  uniqueUserSprintNumber: sql`UNIQUE (user_id, sprint_number)`,
 }));
 
 export const sprintCommitments = pgTable("sprint_commitments", {
@@ -55,6 +66,11 @@ export const sprintCommitments = pgTable("sprint_commitments", {
   newCommitmentIdx: index("idx_sprint_commitments_new").on(table.isNewCommitment),
   // Index for type-based filtering and validation
   typeIdx: index("idx_sprint_commitments_type").on(table.type),
+  // Constraints
+  validCommitmentType: sql`CHECK (type IN ('build', 'test', 'pto'))`,
+  buildDescriptionRequired: sql`CHECK (type != 'build' OR (type = 'build' AND description IS NOT NULL AND length(trim(description)) > 0))`,
+  // Unique constraint: one commitment per user per sprint
+  uniqueUserSprintCommitment: sql`UNIQUE (user_id, sprint_id)`,
 }));
 
 export const webhookLogs = pgTable("webhook_logs", {
@@ -76,6 +92,11 @@ export const webhookLogs = pgTable("webhook_logs", {
   createdAtIdx: index("idx_webhook_logs_created_at").on(table.createdAt),
   // Index for sprint-specific webhook tracking
   sprintIdIdx: index("idx_webhook_logs_sprint").on(table.sprintId),
+  // Constraints
+  validWebhookType: sql`CHECK (webhook_type IN ('new_commitment', 'dashboard_completion'))`,
+  validStatus: sql`CHECK (status IN ('success', 'failed'))`,
+  payloadNotEmpty: sql`CHECK (length(trim(payload)) > 0)`,
+  validJsonPayload: sql`CHECK (payload::json IS NOT NULL)`,
 }));
 
 // Relations
