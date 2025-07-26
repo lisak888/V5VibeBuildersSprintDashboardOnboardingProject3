@@ -36,6 +36,7 @@ export interface IStorage {
   updateSprintCommitment(id: string, updates: Partial<InsertSprintCommitment>): Promise<SprintCommitment>;
   deleteSprintCommitment(id: string): Promise<void>;
   getCommitmentsBySprintId(sprintId: string): Promise<SprintCommitment[]>;
+  getSprintsByIds(userId: string, sprintIds: string[]): Promise<Sprint[]>;
 
   // Webhook log methods
   createWebhookLog(log: InsertWebhookLog): Promise<WebhookLog>;
@@ -114,7 +115,6 @@ export class DatabaseStorage implements IStorage {
       .orderBy(asc(sprints.sprintNumber));
   }
 
-  // Sprint commitment methods
   async getSprintCommitments(userId: string, sprintIds?: string[]): Promise<SprintCommitment[]> {
     let query = db
       .select()
@@ -131,6 +131,22 @@ export class DatabaseStorage implements IStorage {
     }
 
     return query.orderBy(desc(sprintCommitments.createdAt));
+  }
+
+  async getSprintsByIds(userId: string, sprintIds: string[]) {
+    if (sprintIds.length === 0) {
+      return [];
+    }
+
+    return await db
+      .select()
+      .from(sprints)
+      .where(
+        and(
+          eq(sprints.userId, userId),
+          inArray(sprints.id, sprintIds)
+        )
+      );
   }
 
   async createSprintCommitment(commitment: InsertSprintCommitment): Promise<SprintCommitment> {

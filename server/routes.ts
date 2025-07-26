@@ -3,6 +3,7 @@ import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { SprintCalculator } from "./services/sprintCalculator";
 import { WebhookService } from "./services/webhookService";
+import { StateChangeDetector } from "./services/stateChangeDetector";
 import { updateSprintCommitmentsSchema } from "@shared/schema";
 import { z } from "zod";
 
@@ -114,53 +115,40 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ message: "User not found" });
       }
 
-      // Get previous state for comparison
-      const sprintIds = validatedData.commitments.map(c => c.sprintId);
-      const previousCommitments = await storage.getSprintCommitments(user.id, sprintIds);
-      const previousCommitmentMap = new Map(
-        previousCommitments.map(c => [c.sprintId, c])
+      // Use StateChangeDetector to analyze changes
+      const changeResult = await StateChangeDetector.detectChangesForFutureSprints(
+        user.id,
+        validatedData.commitments
       );
 
-      const newCommitments: Array<{ sprint: any; commitment: any }> = [];
-
-      // Process each commitment
+      // Update sprints with new commitments
       for (const commitmentData of validatedData.commitments) {
-        const sprint = await storage.getSprintById(commitmentData.sprintId);
-        if (!sprint) continue;
-
-        const previousCommitment = previousCommitmentMap.get(commitmentData.sprintId);
-        const hadPreviousCommitment = previousCommitment || sprint.type;
-
-        // Update sprint with new commitment
         await storage.updateSprint(commitmentData.sprintId, {
           type: commitmentData.type || null,
           description: commitmentData.description || null,
         });
+      }
 
-        // If this is a new commitment (previously null/empty and now has a value)
-        if (!hadPreviousCommitment && commitmentData.type) {
-          const updatedSprint = await storage.getSprintById(commitmentData.sprintId);
-          if (updatedSprint) {
-            // Create commitment record for webhook tracking
-            const commitment = await storage.createSprintCommitment({
-              userId: user.id,
-              sprintId: commitmentData.sprintId,
-              type: commitmentData.type,
-              description: commitmentData.description || null,
-              isNewCommitment: true,
-            });
+      // Create commitment records for new commitments
+      const newCommitmentRecords: Array<{ sprint: any; commitment: any }> = [];
+      for (const trigger of changeResult.webhookTriggers) {
+        const commitment = await storage.createSprintCommitment({
+          userId: user.id,
+          sprintId: trigger.sprintId,
+          type: trigger.commitment.type,
+          description: trigger.commitment.description || null,
+          isNewCommitment: true,
+        });
 
-            newCommitments.push({ sprint: updatedSprint, commitment });
-          }
-        }
+        newCommitmentRecords.push({ sprint: trigger.sprint, commitment });
       }
 
       // Send webhooks for new commitments sequentially
-      if (newCommitments.length > 0) {
+      if (newCommitmentRecords.length > 0) {
         const webhookResults = await WebhookService.sendNewCommitmentWebhooks(
           user.id,
           user.username,
-          newCommitments
+          newCommitmentRecords
         );
 
         console.log(`Sent ${webhookResults.sent} webhooks, ${webhookResults.failed} failed`);
@@ -175,10 +163,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const ptoCount = futureCommittedSprints.filter(s => s.type === "pto").length;
       const isValid = buildCount >= 2 && ptoCount <= 2;
 
+      const changeSummary = StateChangeDetector.getChangeSummary(changeResult);
+
       res.json({
         success: true,
-        newCommitments: newCommitments.length,
-        webhooksSent: newCommitments.length,
+        newCommitments: changeSummary.newCommitments,
+        webhooksSent: newCommitmentRecords.length,
+        changes: {
+          hasChanges: changeResult.hasChanges,
+          totalChanges: changeSummary.totalChanges,
+          newCommitments: changeSummary.newCommitments,
+          typeChanges: changeSummary.typeChanges,
+          descriptionChanges: changeSummary.descriptionChanges,
+          removals: changeSummary.removals,
+        },
         validation: {
           isValid,
           buildCount,
