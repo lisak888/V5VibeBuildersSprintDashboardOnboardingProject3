@@ -1,0 +1,91 @@
+I want to build a personal sprint commitment dashboard for the Vibe Builders Collective with the following hybrid architecture requirements:
+PROJECT VISION:
+- Personal dashboard for managing historic, current, and future sprint cycles with dynamic date calculation
+- Sprint commitment system supporting Build, Test, and PTO designations
+- Hybrid architecture: Replit for web interface, Make.com for automation
+- Intelligent webhook and API integration between Replit and Make.com
+- Public deployment enabling collective visibility
+- Sprint transitions triggered by a scheduled external service (Make.com)
+
+DYNAMIC SPRINT SCHEDULE SPECIFICATIONS:
+- Sprint cycles start every Friday at 12:01 AM in member's local time
+- First sprint started: June 20, 2025
+- Sprint progression: Every 14 days from June 20, 2025 (continuing indefinitely)
+- Dynamic calculation: Sprint dates calculated from June 20, 2025 to current system date
+- Sprint determination: Current sprint based on user's current date when building dashboard
+- Historic sprints: Up to 24 previous sprints (1 year maximum), dynamically calculated
+- Future sprints: 6 upcoming sprints for planning
+
+SPRINT DESIGNATION DISTRIBUTION RULES:
+- Maximum 2 PTO sprints per 6-sprint rolling window (3 months)
+- Minimum 2 Build sprints per 6-sprint rolling window (3 months)
+- NO minimum or maximum for Test sprints
+- Real-time validation must enforce these constraints
+
+DYNAMIC INITIAL DASHBOARD STATE:
+When first deployed, the dashboard must dynamically:
+1. Calculate all sprint dates from June 20, 2025 to current date
+2. Determine which sprint is currently active based on system date
+3. Display dashboard with:
+   - 1 Historic Sprint: "Build" status with description "Setting up the Vibe Builders individual member dashboard as part of Onboarding Project 3"
+   - 1 Current Sprint: "Build" status with description "Setting up the Vibe Builders individual member dashboard as part of Onboarding Project 3"
+   - 6 Future Sprints: all editable by user with an initial empty/null state.
+
+AUTOMATIC SPRINT TRANSITION LOGIC:
+- Sprint transition is triggered by an external scheduler (Make.com) calling a dedicated API endpoint in Replit.
+- Future sprint becomes current sprint, current becomes historic.
+- New future sprint added to maintain a 6-sprint planning horizon.
+- User commitments carry forward during the transition.
+
+REPLIT DASHBOARD REQUIREMENTS:
+
+1. Dynamic Sprint Display Interface:
+   - Historic, Current, and Future sprint sections.
+   - Future sprints section must be editable with dropdowns (Build/Test/PTO) and a description field for Build sprints.
+
+2. Sprint Calculation & Validation:
+   - Logic to calculate sprint dates from the June 20, 2025 anchor.
+   - Real-time validation to enforce the 2 PTO / 2 Build rule per window.
+
+3. Intelligent Webhook and API Integration:
+   - **Sprint Transition API Endpoint:**
+     - Expose a secure API endpoint: `POST /api/advance-sprint`.
+     - This endpoint is designed to be called exclusively by a scheduled Make.com scenario.
+     - Its sole function is to execute the sprint transition logic: re-calculate sprint buckets, promote sprint statuses in the database, and add a new future sprint.
+   - **Intelligent Webhook Trigger Logic for New Commitments:**
+     - The system must send a webhook to Make.com only when a user sets a commitment for a future sprint for the *very first time*.
+     - **Trigger Event:** This logic must run when a user saves their sprint plan.
+     - **Implementation Steps:**
+       1. **Fetch Previous State:** Before saving, query the database for the user's current commitments for the six future sprints.
+       2. **Compare States:** As you process the user's new submission, compare the previous state to the new state for each of the six future sprints.
+       3. **Identify New Commitments:** Identify each sprint where the previous commitment type was `null` or empty and the new type is now `Build`, `Test`, or `PTO`.
+       4. **Send Sequential Webhooks:** For **every sprint** that meets this condition, the application must make a **distinct, individual call** to the webhook function. Do NOT batch these into a single array. If a user sets three new commitments at once, this must result in three separate webhook pings to Make.com.
+   - **Dashboard Completion Webhook:**
+     - Send a one-time webhook to Make.com when the dashboard is first deployed and completed by the user.
+
+TECHNICAL ARCHITECTURE:
+- Node.js/Express backend with a database.
+- **API Endpoint:** A route (`/api/advance-sprint`) that handles the state transition logic when triggered externally.
+- **Webhook Service:** A service capable of sending sequential, individual HTTP POST requests for each newly committed sprint, based on state-change detection.
+- **State Management:** Logic to compare new user input against the last saved state in the database to identify new commitments.
+
+WEBHOOK PAYLOAD SPECIFICATIONS:
+
+- **New Sprint Commitment Webhook (Single Object Payload):**
+  - This webhook fires for each newly committed sprint.
+  - The payload must be a single JSON object, not an array.
+  - `user_name`: string
+  - `sprint_start_date`: string (format "YYYY-MM-DD")
+  - `sprint_type`: string ("Build", "Test", or "PTO")
+  - `description`: string (if type is "Build")
+  - `dashboard_url`: string
+  - `timestamp`: ISO 8601 string
+
+- **Dashboard Completion Webhook:**
+  - `user_name`: string
+  - `dashboard_url`: string
+  - `completion_timestamp`: ISO 8601 string
+
+Please create a comprehensive PROJECT-PRD.md file based on these instructions, focusing on detailed user stories, acceptance criteria, and technical specifications that reflect the intelligent webhook triggering and the clear separation of concerns between the Replit API and Make.com's scheduling role. Important bullet corrections embedded:
+* Max 2 PTO / Min 2 Build per 6-sprint window, no constraints on Test.
+* Time calculations anchored to 20 Jun 2025; dynamic “today” derived via new Date()
