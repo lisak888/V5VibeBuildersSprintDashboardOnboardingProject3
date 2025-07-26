@@ -160,6 +160,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         console.log(`Sent ${webhookResults.sent} webhooks, ${webhookResults.failed} failed`);
       }
 
+      // Check for dashboard completion after commitment updates
+      const completionSent = await WebhookService.checkDashboardCompletion(user.id, user.username);
+      if (completionSent) {
+        console.log(`Dashboard completion webhook sent for user ${user.username}`);
+      }
+
       // Get updated data
       const allSprints = await storage.getUserSprints(user.id);
       const futureSprints = allSprints.filter(s => s.status === "future");

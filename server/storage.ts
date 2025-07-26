@@ -271,7 +271,7 @@ export class DatabaseStorage implements IStorage {
         await tx
           .delete(sprintCommitments)
           .where(eq(sprintCommitments.sprintId, sprintId));
-        
+
         // Then delete the sprint
         await tx
           .delete(sprints)
@@ -319,6 +319,17 @@ export class DatabaseStorage implements IStorage {
           });
       }
     });
+  }
+
+  async getWebhookLogByUserAndType(userId: string, webhookType: string): Promise<WebhookLog | null> {
+    const [log] = await db
+      .select()
+      .from(webhookLogs)
+      .where(and(eq(webhookLogs.userId, userId), eq(webhookLogs.webhookType, webhookType)))
+      .orderBy(desc(webhookLogs.createdAt))
+      .limit(1);
+
+    return log || null;
   }
 }
 
