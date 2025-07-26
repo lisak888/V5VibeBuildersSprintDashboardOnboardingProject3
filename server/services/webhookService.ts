@@ -34,7 +34,7 @@ export class WebhookService {
         sprint_start_date: sprint.startDate.toISOString().split('T')[0],
         sprint_type: this.capitalizeSprintType(commitment.type),
         description: commitment.description || undefined,
-        dashboard_url: this.getDashboardUrl(),
+        dashboard_url: this.generateDashboardUrl(username),
         timestamp: new Date().toISOString(),
       };
 
@@ -60,7 +60,7 @@ export class WebhookService {
       return success;
     } catch (error) {
       console.error("Failed to send new commitment webhook:", error);
-      
+
       // Log failed webhook attempt
       await storage.createWebhookLog({
         userId,
@@ -84,7 +84,7 @@ export class WebhookService {
     try {
       const payload: DashboardCompletionWebhookPayload = {
         user_name: username,
-        dashboard_url: this.getDashboardUrl(),
+        dashboard_url: this.generateDashboardUrl(username),
         completion_timestamp: new Date().toISOString(),
       };
 
@@ -109,7 +109,7 @@ export class WebhookService {
       return success;
     } catch (error) {
       console.error("Failed to send dashboard completion webhook:", error);
-      
+
       // Log failed webhook attempt
       await storage.createWebhookLog({
         userId,
@@ -140,7 +140,7 @@ export class WebhookService {
       } else {
         failed++;
       }
-      
+
       // Small delay between webhook calls to avoid overwhelming the service
       if (newCommitments.length > 1) {
         await new Promise(resolve => setTimeout(resolve, 100));
@@ -163,12 +163,47 @@ export class WebhookService {
     }
   }
 
-  private static getDashboardUrl(): string {
-    const replitDomains = process.env.REPLIT_DOMAINS;
-    if (replitDomains) {
-      const domains = replitDomains.split(',');
-      return `https://${domains[0]}`;
+  /**
+   * Generate dynamic dashboard URL based on environment
+   */
+  private static generateDashboardUrl(username: string): string {
+    // In production, use the deployed URL
+    if (process.env.NODE_ENV === 'production') {
+      // Check for custom domain or use Replit deployment URL
+      const customDomain = process.env.CUSTOM_DOMAIN;
+      if (customDomain) {
+        return `https://${customDomain}/dashboard/${username}`;
+      }
+
+      // Replit deployment URLs follow pattern: https://{repl-id}.{username}.repl.co
+      const replId = process.env.REPL_SLUG || 'vibe-builders-dashboard';
+      const replOwner = process.env.REPL_OWNER || 'user';
+      return `https://${replId}.${replOwner}.repl.co/dashboard/${username}`;
     }
-    return process.env.DASHBOARD_URL || "http://localhost:5000";
+
+    // In development, use local URL with proper binding
+    const port = process.env.PORT || '5000';
+    const host = process.env.NODE_ENV === 'development' ? 'localhost' : '0.0.0.0';
+    return `http://${host}:${port}/dashboard/${username}`;
+  }
+
+  /**
+   * Get the base application URL for webhook payloads
+   */
+  private static getBaseUrl(): string {
+    if (process.env.NODE_ENV === 'production') {
+      const customDomain = process.env.CUSTOM_DOMAIN;
+      if (customDomain) {
+        return `https://${customDomain}`;
+      }
+
+      const replId = process.env.REPL_SLUG || 'vibe-builders-dashboard';
+      const replOwner = process.env.REPL_OWNER || 'user';
+      return `https://${replId}.${replOwner}.repl.co`;
+    }
+
+    const port = process.env.PORT || '5000';
+    const host = process.env.NODE_ENV === 'development' ? 'localhost' : '0.0.0.0';
+    return `http://${host}:${port}`;
   }
 }
