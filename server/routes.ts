@@ -121,27 +121,33 @@ export async function registerRoutes(app: Express): Promise<Server> {
         validatedData.commitments
       );
 
-      // Update sprints with new commitments
-      for (const commitmentData of validatedData.commitments) {
-        await storage.updateSprint(commitmentData.sprintId, {
-          type: commitmentData.type || null,
-          description: commitmentData.description || null,
-        });
-      }
+      // Prepare transaction data
+      const commitmentUpdates = validatedData.commitments.map(c => ({
+        sprintId: c.sprintId,
+        type: c.type || null,
+        description: c.description || null,
+      }));
 
-      // Create commitment records for new commitments
-      const newCommitmentRecords: Array<{ sprint: any; commitment: any }> = [];
-      for (const trigger of changeResult.webhookTriggers) {
-        const commitment = await storage.createSprintCommitment({
+      const newCommitmentData = changeResult.webhookTriggers.map(trigger => ({
+        sprintId: trigger.sprintId,
+        type: trigger.commitment.type,
+        description: trigger.commitment.description || null,
+      }));
+
+      // Execute all commitment updates in a single transaction
+      await storage.executeCommitmentUpdate(user.id, commitmentUpdates, newCommitmentData);
+
+      // Prepare webhook records for response
+      const newCommitmentRecords: Array<{ sprint: any; commitment: any }> = changeResult.webhookTriggers.map(trigger => ({
+        sprint: trigger.sprint,
+        commitment: {
           userId: user.id,
           sprintId: trigger.sprintId,
           type: trigger.commitment.type,
           description: trigger.commitment.description || null,
           isNewCommitment: true,
-        });
-
-        newCommitmentRecords.push({ sprint: trigger.sprint, commitment });
-      }
+        }
+      }));
 
       // Send webhooks for new commitments sequentially
       if (newCommitmentRecords.length > 0) {
@@ -219,18 +225,31 @@ export async function registerRoutes(app: Express): Promise<Server> {
           // Get user's existing sprints
           const userSprints = await storage.getUserSprints(user.id);
           
-          // Update sprint statuses based on current calculations
+          // Prepare transaction operations
+          const statusUpdates: Array<{ sprintId: string; status: "historic" | "current" | "future" }> = [];
+          const newSprints: Array<{
+            sprintNumber: number;
+            startDate: Date;
+            endDate: Date;
+            type: "build" | "test" | "pto" | null;
+            description: string | null;
+            status: "historic" | "current" | "future";
+          }> = [];
+          const sprintsToDelete: string[] = [];
+
+          // Collect sprint status updates
           for (const sprint of userSprints) {
             const sprintInfo = SprintCalculator.getSprintInfo(sprint.sprintNumber);
             
-            // Update sprint status if it has changed
             if (sprint.status !== sprintInfo.status) {
-              await storage.updateSprintStatus(sprint.id, sprintInfo.status);
-              totalSprintsProcessed++;
+              statusUpdates.push({
+                sprintId: sprint.id,
+                status: sprintInfo.status
+              });
             }
           }
 
-          // Check if we need to create new future sprints
+          // Collect new sprints to create
           const existingSprintNumbers = new Set(userSprints.map(s => s.sprintNumber));
           const allRequiredSprints = [
             ...sprintNumbers.historic,
@@ -238,13 +257,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
             ...sprintNumbers.future
           ];
 
-          // Create any missing sprints (typically new future sprints)
           const missingSprintNumbers = allRequiredSprints.filter(num => !existingSprintNumbers.has(num));
           
           for (const sprintNumber of missingSprintNumbers) {
             const sprintInfo = SprintCalculator.getSprintInfo(sprintNumber);
-            await storage.createSprint({
-              userId: user.id,
+            newSprints.push({
               sprintNumber,
               startDate: sprintInfo.startDate,
               endDate: sprintInfo.endDate,
@@ -252,20 +269,27 @@ export async function registerRoutes(app: Express): Promise<Server> {
               description: null,
               status: sprintInfo.status,
             });
-            totalSprintsProcessed++;
           }
 
-          // Remove old historic sprints beyond the 24-sprint limit
+          // Collect old historic sprints to remove
           const historicSprints = userSprints
             .filter(s => s.status === 'historic')
             .sort((a, b) => a.sprintNumber - b.sprintNumber);
           
           if (historicSprints.length > 24) {
             const sprintsToRemove = historicSprints.slice(0, historicSprints.length - 24);
-            for (const sprintToRemove of sprintsToRemove) {
-              await storage.deleteSprint(sprintToRemove.id);
-              totalSprintsProcessed++;
-            }
+            sprintsToDelete.push(...sprintsToRemove.map(s => s.id));
+          }
+
+          // Execute all operations in a single transaction
+          if (statusUpdates.length > 0 || newSprints.length > 0 || sprintsToDelete.length > 0) {
+            await storage.executeSprintTransition(user.id, {
+              statusUpdates,
+              newSprints,
+              sprintsToDelete
+            });
+            
+            totalSprintsProcessed += statusUpdates.length + newSprints.length + sprintsToDelete.length;
           }
 
           usersProcessed++;

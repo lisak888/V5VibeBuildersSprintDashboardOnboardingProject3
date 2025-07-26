@@ -43,6 +43,10 @@ export interface IStorage {
   getWebhookLogs(userId: string): Promise<WebhookLog[]>;
 }
 
+// Transaction type for database operations
+type TransactionDb = typeof db;
+type TransactionFn<T> = (tx: TransactionDb) => Promise<T>;
+
 export class DatabaseStorage implements IStorage {
   // User methods
   async getUser(id: string): Promise<User | undefined> {
@@ -215,6 +219,10 @@ export class DatabaseStorage implements IStorage {
     await db
       .delete(sprints)
       .where(eq(sprints.id, sprintId));
+  }
+
+  async executeTransaction<T>(fn: TransactionFn<T>): Promise<T> {
+    return await db.transaction(fn);
   }
 }
 
