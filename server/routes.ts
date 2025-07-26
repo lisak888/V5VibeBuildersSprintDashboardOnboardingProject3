@@ -203,29 +203,95 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(401).json({ message: "Unauthorized" });
       }
 
-      // Get all users
-      // Note: In a production system, you'd probably want to process users in batches
-      const users = await storage.getUserByUsername("*"); // This would need to be implemented differently
-
-      // For now, we'll just update sprint statuses based on current date
+      // Get current sprint calculations
+      const sprintNumbers = SprintCalculator.getAllRelevantSprintNumbers();
       const currentSprintNumber = SprintCalculator.getCurrentSprintNumber();
 
-      console.log(`Advancing to sprint ${currentSprintNumber}`);
+      console.log(`Starting sprint transition to sprint ${currentSprintNumber}`);
+      
+      // Get all users to process their sprints
+      const allUsers = await storage.getAllUsers();
+      let totalSprintsProcessed = 0;
+      let usersProcessed = 0;
 
-      // This would involve:
-      // 1. Moving current sprints to historic
-      // 2. Moving first future sprint to current
-      // 3. Adding new future sprint
-      // 4. Updating all sprint statuses
+      for (const user of allUsers) {
+        try {
+          // Get user's existing sprints
+          const userSprints = await storage.getUserSprints(user.id);
+          
+          // Update sprint statuses based on current calculations
+          for (const sprint of userSprints) {
+            const sprintInfo = SprintCalculator.getSprintInfo(sprint.sprintNumber);
+            
+            // Update sprint status if it has changed
+            if (sprint.status !== sprintInfo.status) {
+              await storage.updateSprintStatus(sprint.id, sprintInfo.status);
+              totalSprintsProcessed++;
+            }
+          }
+
+          // Check if we need to create new future sprints
+          const existingSprintNumbers = new Set(userSprints.map(s => s.sprintNumber));
+          const allRequiredSprints = [
+            ...sprintNumbers.historic,
+            sprintNumbers.current,
+            ...sprintNumbers.future
+          ];
+
+          // Create any missing sprints (typically new future sprints)
+          const missingSprintNumbers = allRequiredSprints.filter(num => !existingSprintNumbers.has(num));
+          
+          for (const sprintNumber of missingSprintNumbers) {
+            const sprintInfo = SprintCalculator.getSprintInfo(sprintNumber);
+            await storage.createSprint({
+              userId: user.id,
+              sprintNumber,
+              startDate: sprintInfo.startDate,
+              endDate: sprintInfo.endDate,
+              type: null, // New future sprints start uncommitted
+              description: null,
+              status: sprintInfo.status,
+            });
+            totalSprintsProcessed++;
+          }
+
+          // Remove old historic sprints beyond the 24-sprint limit
+          const historicSprints = userSprints
+            .filter(s => s.status === 'historic')
+            .sort((a, b) => a.sprintNumber - b.sprintNumber);
+          
+          if (historicSprints.length > 24) {
+            const sprintsToRemove = historicSprints.slice(0, historicSprints.length - 24);
+            for (const sprintToRemove of sprintsToRemove) {
+              await storage.deleteSprint(sprintToRemove.id);
+              totalSprintsProcessed++;
+            }
+          }
+
+          usersProcessed++;
+        } catch (userError) {
+          console.error(`Error processing user ${user.username}:`, userError);
+          // Continue processing other users even if one fails
+        }
+      }
+
+      console.log(`Sprint transition completed: ${usersProcessed} users processed, ${totalSprintsProcessed} sprint updates made`);
 
       res.json({
         success: true,
         message: "Sprint transition completed",
         currentSprint: currentSprintNumber,
+        usersProcessed,
+        sprintUpdates: totalSprintsProcessed,
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       console.error("Error advancing sprint:", error);
-      res.status(500).json({ message: "Failed to advance sprint" });
+      res.status(500).json({ 
+        success: false,
+        message: "Failed to advance sprint",
+        error: error instanceof Error ? error.message : "Unknown error"
+      });
     }
   });
 

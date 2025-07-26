@@ -193,6 +193,29 @@ export class DatabaseStorage implements IStorage {
       .where(eq(webhookLogs.userId, userId))
       .orderBy(desc(webhookLogs.createdAt));
   }
+
+  async getAllUsers(): Promise<User[]> {
+    return db.select().from(users);
+  }
+
+  async updateSprintStatus(sprintId: string, status: "historic" | "current" | "future"): Promise<void> {
+    await db
+      .update(sprints)
+      .set({ status })
+      .where(eq(sprints.id, sprintId));
+  }
+
+  async deleteSprint(sprintId: string): Promise<void> {
+    // First delete any related sprint commitments
+    await db
+      .delete(sprintCommitments)
+      .where(eq(sprintCommitments.sprintId, sprintId));
+
+    // Then delete the sprint
+    await db
+      .delete(sprints)
+      .where(eq(sprints.id, sprintId));
+  }
 }
 
 export const storage = new DatabaseStorage();
