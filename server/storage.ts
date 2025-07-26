@@ -237,6 +237,266 @@ export class DatabaseStorage implements IStorage {
     return await db.transaction(fn);
   }
 
+  // Efficient query methods for dashboard operations
+  
+  /**
+   * Get complete dashboard data in a single optimized query
+   * Uses joins to reduce database round trips
+   */
+  async getDashboardData(userId: string): Promise<{
+    user: User;
+    sprints: Sprint[];
+    commitments: SprintCommitment[];
+  }> {
+    // Get user data
+    const user = await this.getUserById(userId);
+    if (!user) {
+      throw new Error(`User not found: ${userId}`);
+    }
+
+    // Get all sprints with optimized query using user index
+    const sprints = await db
+      .select()
+      .from(sprints as any)
+      .where(eq(sprints.userId, userId))
+      .orderBy(asc(sprints.sprintNumber));
+
+    // Get all commitments in a single query
+    const commitments = await this.getSprintCommitments(userId);
+
+    return { user, sprints, commitments };
+  }
+
+  /**
+   * Efficiently get sprints by status with single query
+   * Leverages composite user_status index
+   */
+  async getSprintsByStatus(userId: string, status: "historic" | "current" | "future"): Promise<Sprint[]> {
+    return await db
+      .select()
+      .from(sprints)
+      .where(
+        and(
+          eq(sprints.userId, userId),
+          eq(sprints.status, status)
+        )
+      )
+      .orderBy(asc(sprints.sprintNumber));
+  }
+
+  /**
+   * Get future sprints with their commitment status efficiently
+   * Optimized for validation operations
+   */
+  async getFutureSprintsWithCommitments(userId: string): Promise<Array<Sprint & { hasCommitment: boolean }>> {
+    const futureSprints = await this.getSprintsByStatus(userId, "future");
+    
+    // Get commitment status in single query
+    const commitmentMap = new Map();
+    if (futureSprints.length > 0) {
+      const sprintIds = futureSprints.map(s => s.id);
+      const commitments = await db
+        .select({ sprintId: sprintCommitments.sprintId })
+        .from(sprintCommitments)
+        .where(
+          and(
+            eq(sprintCommitments.userId, userId),
+            inArray(sprintCommitments.sprintId, sprintIds)
+          )
+        );
+      
+      commitments.forEach(c => commitmentMap.set(c.sprintId, true));
+    }
+
+    return futureSprints.map(sprint => ({
+      ...sprint,
+      hasCommitment: commitmentMap.has(sprint.id) || false
+    }));
+  }
+
+  /**
+   * Batch query for sprint validation
+   * Gets all data needed for 6-sprint rolling window validation
+   */
+  async getValidationData(userId: string, sprintNumbers: number[]): Promise<{
+    sprints: Sprint[];
+    commitmentCounts: { build: number; test: number; pto: number; total: number };
+  }> {
+    if (sprintNumbers.length === 0) {
+      return { sprints: [], commitmentCounts: { build: 0, test: 0, pto: 0, total: 0 } };
+    }
+
+    // Get sprints in the validation window
+    const sprints = await db
+      .select()
+      .from(sprints)
+      .where(
+        and(
+          eq(sprints.userId, userId),
+          inArray(sprints.sprintNumber, sprintNumbers)
+        )
+      )
+      .orderBy(asc(sprints.sprintNumber));
+
+    // Count commitments by type in single query
+    const sprintIds = sprints.filter(s => s.type).map(s => s.id);
+    let commitmentCounts = { build: 0, test: 0, pto: 0, total: 0 };
+
+    if (sprintIds.length > 0) {
+      const counts = await db
+        .select({
+          type: sprints.type,
+          count: sql<number>`count(*)`.as('count')
+        })
+        .from(sprints)
+        .where(
+          and(
+            eq(sprints.userId, userId),
+            inArray(sprints.id, sprintIds),
+            isNotNull(sprints.type)
+          )
+        )
+        .groupBy(sprints.type);
+
+      counts.forEach(({ type, count }) => {
+        if (type === 'build') commitmentCounts.build = Number(count);
+        else if (type === 'test') commitmentCounts.test = Number(count);
+        else if (type === 'pto') commitmentCounts.pto = Number(count);
+        commitmentCounts.total += Number(count);
+      });
+    }
+
+    return { sprints, commitmentCounts };
+  }
+
+  /**
+   * Efficiently check if user has completed dashboard setup
+   * Used for dashboard completion webhook logic
+   */
+  async hasCompletedDashboard(userId: string): Promise<boolean> {
+    const [result] = await db
+      .select({ count: sql<number>`count(*)`.as('count') })
+      .from(sprints)
+      .where(
+        and(
+          eq(sprints.userId, userId),
+          eq(sprints.status, "future"),
+          isNotNull(sprints.type)
+        )
+      );
+
+    return Number(result?.count || 0) > 0;
+  }
+
+  /**
+   * Get webhook logs with efficient filtering
+   * Leverages composite indexes for monitoring
+   */
+  async getWebhookLogs(
+    userId: string,
+    options: {
+      webhookType?: "new_commitment" | "dashboard_completion";
+      status?: "success" | "failed";
+      limit?: number;
+    } = {}
+  ): Promise<WebhookLog[]> {
+    let query = db
+      .select()
+      .from(webhookLogs)
+      .where(eq(webhookLogs.userId, userId));
+
+    if (options.webhookType) {
+      query = query.where(
+        and(
+          eq(webhookLogs.userId, userId),
+          eq(webhookLogs.webhookType, options.webhookType)
+        )
+      );
+    }
+
+    if (options.status) {
+      query = query.where(
+        and(
+          eq(webhookLogs.userId, userId),
+          eq(webhookLogs.status, options.status)
+        )
+      );
+    }
+
+    query = query.orderBy(desc(webhookLogs.createdAt));
+
+    if (options.limit) {
+      query = query.limit(options.limit);
+    }
+
+    return await query;
+  }
+
+  /**
+   * Batch operation for checking dashboard completion status
+   * Used by webhook service for efficient completion detection
+   */
+  async checkDashboardCompletionSent(userId: string): Promise<boolean> {
+    const [result] = await db
+      .select({ count: sql<number>`count(*)`.as('count') })
+      .from(webhookLogs)
+      .where(
+        and(
+          eq(webhookLogs.userId, userId),
+          eq(webhookLogs.webhookType, "dashboard_completion"),
+          eq(webhookLogs.status, "success")
+        )
+      );
+
+    return Number(result?.count || 0) > 0;
+  }
+
+  /**
+   * Efficient sprint cleanup for historic data management
+   * Removes old historic sprints beyond the 24-sprint limit
+   */
+  async cleanupOldHistoricSprints(userId: string, keepCount: number = 24): Promise<number> {
+    // Get all historic sprints ordered by sprint number
+    const historicSprints = await db
+      .select({ id: sprints.id, sprintNumber: sprints.sprintNumber })
+      .from(sprints)
+      .where(
+        and(
+          eq(sprints.userId, userId),
+          eq(sprints.status, "historic")
+        )
+      )
+      .orderBy(asc(sprints.sprintNumber));
+
+    if (historicSprints.length <= keepCount) {
+      return 0; // No cleanup needed
+    }
+
+    // Identify sprints to remove (oldest ones)
+    const sprintsToRemove = historicSprints.slice(0, historicSprints.length - keepCount);
+    const sprintIdsToRemove = sprintsToRemove.map(s => s.id);
+
+    // Use transaction for cleanup
+    return await db.transaction(async (tx) => {
+      // Delete related commitments first
+      await tx
+        .delete(sprintCommitments)
+        .where(inArray(sprintCommitments.sprintId, sprintIdsToRemove));
+
+      // Delete related webhook logs
+      await tx
+        .delete(webhookLogs)
+        .where(inArray(webhookLogs.sprintId, sprintIdsToRemove));
+
+      // Delete the sprints
+      const deleteResult = await tx
+        .delete(sprints)
+        .where(inArray(sprints.id, sprintIdsToRemove));
+
+      return sprintsToRemove.length;
+    });
+  }
+
   // Transaction-based sprint transition operations
   async executeSprintTransition(
     userId: string,

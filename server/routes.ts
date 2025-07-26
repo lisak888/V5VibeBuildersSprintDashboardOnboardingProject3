@@ -60,16 +60,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
         });
       }
 
-      // Get all sprints with updated data
-      const allSprints = await storage.getUserSprints(user.id);
+      // Get all data efficiently using optimized queries
+      const dashboardData = await storage.getDashboardData(user.id);
+      const { sprints: allSprints, commitments: sprintCommitments } = dashboardData;
 
-      // Get sprint commitments
-      const sprintCommitments = await storage.getSprintCommitments(user.id);
-
-      // Organize data
-      const historicSprints = allSprints.filter(s => s.status === "historic");
-      const currentSprint = allSprints.find(s => s.status === "current");
-      const futureSprints = allSprints.filter(s => s.status === "future");
+      // Organize data using efficient filtering
+      const historicSprints = await storage.getSprintsByStatus(user.id, "historic");
+      const currentSprint = await storage.getSprintsByStatus(user.id, "current").then(sprints => sprints[0]);
+      const futureSprints = await storage.getSprintsByStatus(user.id, "future");
 
       // Calculate stats for validation
       const futureCommittedSprints = futureSprints.filter(s => s.type);
@@ -166,14 +164,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         console.log(`Dashboard completion webhook sent for user ${user.username}`);
       }
 
-      // Get updated data
-      const allSprints = await storage.getUserSprints(user.id);
-      const futureSprints = allSprints.filter(s => s.status === "future");
-      const futureCommittedSprints = futureSprints.filter(s => s.type);
+      // Get updated data using efficient query
+      const futureSprints = await storage.getSprintsByStatus(user.id, "future");
+      const futureSprintNumbers = futureSprints.map(s => s.sprintNumber);
+      const validationData = await storage.getValidationData(user.id, futureSprintNumbers);
 
-      const buildCount = futureCommittedSprints.filter(s => s.type === "build").length;
-      const ptoCount = futureCommittedSprints.filter(s => s.type === "pto").length;
-      const isValid = buildCount >= 2 && ptoCount <= 2;
+      const { commitmentCounts } = validationData;
+      const isValid = commitmentCounts.build >= 2 && commitmentCounts.pto <= 2;
 
       const changeSummary = StateChangeDetector.getChangeSummary(changeResult);
 

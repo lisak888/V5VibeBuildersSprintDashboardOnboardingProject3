@@ -77,25 +77,21 @@ export class WebhookService {
   /**
    * Check if dashboard completion webhook should be sent
    */
-  static async checkDashboardCompletion(
-    userId: string,
-    username: string
-  ): Promise<boolean> {
+  static async checkDashboardCompletion(userId: string, username: string): Promise<boolean> {
     try {
-      // Check if completion webhook has already been sent
-      const existingLog = await storage.getWebhookLogByUserAndType(userId, "dashboard_completion");
-      if (existingLog && existingLog.status === "success") {
-        return false; // Already sent successfully
+      // Check if completion webhook was already sent using efficient query
+      const alreadySent = await storage.checkDashboardCompletionSent(userId);
+
+      if (alreadySent) {
+        return false; // Already sent
       }
 
-      // Check if user has at least one future sprint commitment
-      const futureSprints = await storage.getUserSprints(userId);
-      const futureCommittedSprints = futureSprints
-        .filter(s => s.status === "future" && s.type !== null);
+      // Check if user has completed dashboard using efficient query
+      const hasCompleted = await storage.hasCompletedDashboard(userId);
 
-      if (futureCommittedSprints.length > 0) {
-        // Dashboard is completed, send webhook
-        return await this.sendDashboardCompletionWebhook(userId, username);
+      if (hasCompleted) {
+        await this.sendDashboardCompletionWebhook(userId, username);
+        return true;
       }
 
       return false;
