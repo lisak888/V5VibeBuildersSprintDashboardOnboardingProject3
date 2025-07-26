@@ -21,17 +21,21 @@ export interface IStorage {
   getUser(id: string): Promise<User | undefined>;
   getUserByUsername(username: string): Promise<User | undefined>;
   createUser(user: InsertUser): Promise<User>;
+  updateUser(id: string, updates: Partial<InsertUser>): Promise<User>;
+  deleteUser(id: string): Promise<void>;
 
   // Sprint methods
   getUserSprints(userId: string): Promise<Sprint[]>;
   getSprintById(id: string): Promise<Sprint | undefined>;
   createSprint(sprint: InsertSprint): Promise<Sprint>;
   updateSprint(id: string, updates: Partial<InsertSprint>): Promise<Sprint>;
+  deleteSprint(id: string): Promise<void>;
   getSprintsByStatus(userId: string, status: "historic" | "current" | "future"): Promise<Sprint[]>;
   getSprintsByNumbers(userId: string, sprintNumbers: number[]): Promise<Sprint[]>;
 
   // Sprint commitment methods
   getSprintCommitments(userId: string, sprintIds?: string[]): Promise<SprintCommitment[]>;
+  getSprintCommitmentById(id: string): Promise<SprintCommitment | undefined>;
   createSprintCommitment(commitment: InsertSprintCommitment): Promise<SprintCommitment>;
   updateSprintCommitment(id: string, updates: Partial<InsertSprintCommitment>): Promise<SprintCommitment>;
   deleteSprintCommitment(id: string): Promise<void>;
@@ -41,6 +45,7 @@ export interface IStorage {
   // Webhook log methods
   createWebhookLog(log: InsertWebhookLog): Promise<WebhookLog>;
   getWebhookLogs(userId: string): Promise<WebhookLog[]>;
+  getWebhookLogByUserAndType(userId: string, webhookType: string): Promise<WebhookLog | null>;
 }
 
 // Transaction type for database operations
@@ -60,11 +65,25 @@ export class DatabaseStorage implements IStorage {
   }
 
   async createUser(insertUser: InsertUser): Promise<User> {
-    const [user] = await db
-      .insert(users)
-      .values(insertUser)
+    const [created] = await db.insert(users).values(insertUser).returning();
+    return created;
+  }
+
+  async updateUser(id: string, updates: Partial<InsertUser>): Promise<User> {
+    const [updated] = await db
+      .update(users)
+      .set(updates)
+      .where(eq(users.id, id))
       .returning();
-    return user;
+    return updated;
+  }
+
+  async deleteUser(id: string): Promise<void> {
+    await db.delete(users).where(eq(users.id, id));
+  }
+
+  async getAllUsers(): Promise<User[]> {
+    return db.select().from(users);
   }
 
   // Sprint methods
@@ -82,10 +101,7 @@ export class DatabaseStorage implements IStorage {
   }
 
   async createSprint(insertSprint: InsertSprint): Promise<Sprint> {
-    const [sprint] = await db
-      .insert(sprints)
-      .values(insertSprint)
-      .returning();
+    const [sprint] = await db.insert(sprints).values(insertSprint).returning();
     return sprint;
   }
 
@@ -96,6 +112,10 @@ export class DatabaseStorage implements IStorage {
       .where(eq(sprints.id, id))
       .returning();
     return sprint;
+  }
+
+  async deleteSprint(id: string): Promise<void> {
+    await db.delete(sprints).where(eq(sprints.id, id));
   }
 
   async getSprintsByStatus(userId: string, status: "historic" | "current" | "future"): Promise<Sprint[]> {
@@ -135,6 +155,14 @@ export class DatabaseStorage implements IStorage {
     }
 
     return query.orderBy(desc(sprintCommitments.createdAt));
+  }
+
+  async getSprintCommitmentById(id: string): Promise<SprintCommitment | undefined> {
+    const [commitment] = await db
+      .select()
+      .from(sprintCommitments)
+      .where(eq(sprintCommitments.id, id));
+    return commitment || undefined;
   }
 
   async getSprintsByIds(userId: string, sprintIds: string[]) {
@@ -198,26 +226,10 @@ export class DatabaseStorage implements IStorage {
       .orderBy(desc(webhookLogs.createdAt));
   }
 
-  async getAllUsers(): Promise<User[]> {
-    return db.select().from(users);
-  }
-
   async updateSprintStatus(sprintId: string, status: "historic" | "current" | "future"): Promise<void> {
     await db
       .update(sprints)
       .set({ status })
-      .where(eq(sprints.id, sprintId));
-  }
-
-  async deleteSprint(sprintId: string): Promise<void> {
-    // First delete any related sprint commitments
-    await db
-      .delete(sprintCommitments)
-      .where(eq(sprintCommitments.sprintId, sprintId));
-
-    // Then delete the sprint
-    await db
-      .delete(sprints)
       .where(eq(sprints.id, sprintId));
   }
 
@@ -227,7 +239,7 @@ export class DatabaseStorage implements IStorage {
 
   // Transaction-based sprint transition operations
   async executeSprintTransition(
-    userId: string, 
+    userId: string,
     operations: {
       statusUpdates: Array<{ sprintId: string; status: "historic" | "current" | "future" }>;
       newSprints: Array<{
