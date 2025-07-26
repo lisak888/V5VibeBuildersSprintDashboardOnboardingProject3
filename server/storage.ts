@@ -13,7 +13,7 @@ import {
   type InsertWebhookLog,
 } from "@shared/schema";
 import { db } from "./db";
-import { eq, and, desc, asc, gte, lte, inArray } from "drizzle-orm";
+import { eq, and, desc, asc, gte, lte, inArray, sql, isNotNull } from "drizzle-orm";
 import { randomUUID } from 'crypto';
 
 export interface IStorage {
@@ -48,9 +48,27 @@ export interface IStorage {
   getWebhookLogByUserAndType(userId: string, webhookType: string): Promise<WebhookLog | null>;
 }
 
-// Transaction type for database operations
+// Transaction types for database operations
 type TransactionDb = typeof db;
 type TransactionFn<T> = (tx: TransactionDb) => Promise<T>;
+
+// Transaction wrapper configuration
+interface TransactionOptions {
+  retries?: number;
+  retryDelay?: number;
+  timeout?: number;
+  isolationLevel?: 'read uncommitted' | 'read committed' | 'repeatable read' | 'serializable';
+  logQueries?: boolean;
+}
+
+// Transaction result wrapper
+interface TransactionResult<T> {
+  success: boolean;
+  data?: T;
+  error?: Error;
+  duration: number;
+  retryCount: number;
+}
 
 export class DatabaseStorage implements IStorage {
   // User methods
@@ -84,6 +102,11 @@ export class DatabaseStorage implements IStorage {
 
   async getAllUsers(): Promise<User[]> {
     return db.select().from(users);
+  }
+
+  async getUserById(id: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user || undefined;
   }
 
   // Sprint methods
@@ -233,8 +256,123 @@ export class DatabaseStorage implements IStorage {
       .where(eq(sprints.id, sprintId));
   }
 
-  async executeTransaction<T>(fn: TransactionFn<T>): Promise<T> {
-    return await db.transaction(fn);
+  /**
+   * Enhanced transaction wrapper with retry logic, timeouts, and comprehensive error handling
+   * Implements Phase 5 requirement for atomic database operations
+   */
+  async executeTransaction<T>(
+    fn: TransactionFn<T>, 
+    options: TransactionOptions = {}
+  ): Promise<TransactionResult<T>> {
+    const {
+      retries = 3,
+      retryDelay = 100,
+      timeout = 30000,
+      isolationLevel = 'read committed',
+      logQueries = process.env.NODE_ENV === 'development'
+    } = options;
+
+    const startTime = Date.now();
+    let lastError: Error | undefined;
+    let retryCount = 0;
+
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        if (logQueries) {
+          console.log(`[TRANSACTION] Starting attempt ${attempt + 1}/${retries + 1} with isolation: ${isolationLevel}`);
+        }
+
+        // Execute transaction with timeout
+        const result = await Promise.race([
+          db.transaction(async (tx) => {
+            // Set isolation level if supported
+            if (isolationLevel !== 'read committed') {
+              await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL ${sql.raw(isolationLevel.toUpperCase())}`);
+            }
+            
+            return await fn(tx);
+          }),
+          new Promise<never>((_, reject) => 
+            setTimeout(() => reject(new Error('Transaction timeout')), timeout)
+          )
+        ]);
+
+        const duration = Date.now() - startTime;
+        
+        if (logQueries) {
+          console.log(`[TRANSACTION] Completed successfully in ${duration}ms after ${retryCount} retries`);
+        }
+
+        return {
+          success: true,
+          data: result,
+          duration,
+          retryCount
+        };
+
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        retryCount = attempt;
+
+        if (logQueries) {
+          console.warn(`[TRANSACTION] Attempt ${attempt + 1} failed: ${lastError.message}`);
+        }
+
+        // Don't retry on certain types of errors
+        if (this.isNonRetryableError(lastError) || attempt === retries) {
+          break;
+        }
+
+        // Wait before retry with exponential backoff
+        const delay = retryDelay * Math.pow(2, attempt);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+
+    const duration = Date.now() - startTime;
+    
+    if (logQueries) {
+      console.error(`[TRANSACTION] Failed after ${retries + 1} attempts in ${duration}ms: ${lastError?.message}`);
+    }
+
+    return {
+      success: false,
+      error: lastError,
+      duration,
+      retryCount
+    };
+  }
+
+  /**
+   * Determine if an error should not be retried
+   */
+  private isNonRetryableError(error: Error): boolean {
+    const nonRetryablePatterns = [
+      /constraint/i,
+      /duplicate/i,
+      /foreign key/i,
+      /check constraint/i,
+      /not null/i,
+      /syntax error/i,
+      /permission denied/i,
+      /authentication/i
+    ];
+
+    return nonRetryablePatterns.some(pattern => pattern.test(error.message));
+  }
+
+  /**
+   * Simplified transaction method for backward compatibility
+   * Uses default options for common operations
+   */
+  async executeSimpleTransaction<T>(fn: TransactionFn<T>): Promise<T> {
+    const result = await this.executeTransaction(fn, { retries: 1, logQueries: false });
+    
+    if (!result.success) {
+      throw result.error || new Error('Transaction failed');
+    }
+    
+    return result.data!;
   }
 
   // Efficient query methods for dashboard operations
@@ -476,8 +614,8 @@ export class DatabaseStorage implements IStorage {
     const sprintsToRemove = historicSprints.slice(0, historicSprints.length - keepCount);
     const sprintIdsToRemove = sprintsToRemove.map(s => s.id);
 
-    // Use transaction for cleanup
-    return await db.transaction(async (tx) => {
+    // Use enhanced transaction for cleanup
+    const result = await this.executeTransaction(async (tx) => {
       // Delete related commitments first
       await tx
         .delete(sprintCommitments)
@@ -489,12 +627,22 @@ export class DatabaseStorage implements IStorage {
         .where(inArray(webhookLogs.sprintId, sprintIdsToRemove));
 
       // Delete the sprints
-      const deleteResult = await tx
+      await tx
         .delete(sprints)
         .where(inArray(sprints.id, sprintIdsToRemove));
 
       return sprintsToRemove.length;
+    }, { 
+      retries: 1, 
+      isolationLevel: 'read committed',
+      logQueries: true
     });
+
+    if (!result.success) {
+      throw new Error(`Sprint cleanup failed: ${result.error?.message}`);
+    }
+
+    return result.data!;
   }
 
   // Transaction-based sprint transition operations
@@ -513,7 +661,7 @@ export class DatabaseStorage implements IStorage {
       sprintsToDelete: string[];
     }
   ): Promise<void> {
-    await db.transaction(async (tx) => {
+    const result = await this.executeTransaction(async (tx) => {
       // Apply status updates
       for (const update of operations.statusUpdates) {
         await tx
@@ -549,7 +697,21 @@ export class DatabaseStorage implements IStorage {
           .delete(sprints)
           .where(eq(sprints.id, sprintId));
       }
+
+      return { 
+        statusUpdates: operations.statusUpdates.length,
+        newSprints: operations.newSprints.length,
+        deletedSprints: operations.sprintsToDelete.length
+      };
+    }, { 
+      retries: 2, 
+      isolationLevel: 'repeatable read',
+      logQueries: true
     });
+
+    if (!result.success) {
+      throw new Error(`Sprint transition failed: ${result.error?.message}`);
+    }
   }
 
   // Transaction-based commitment updates
@@ -566,7 +728,7 @@ export class DatabaseStorage implements IStorage {
       description: string | null;
     }>
   ): Promise<void> {
-    await db.transaction(async (tx) => {
+    const result = await this.executeTransaction(async (tx) => {
       // Update sprint data
       for (const update of commitmentUpdates) {
         await tx
@@ -590,7 +752,20 @@ export class DatabaseStorage implements IStorage {
             description: commitment.description,
           });
       }
+
+      return {
+        updatedSprints: commitmentUpdates.length,
+        newCommitments: newCommitmentData.length
+      };
+    }, { 
+      retries: 2, 
+      isolationLevel: 'read committed',
+      logQueries: true
     });
+
+    if (!result.success) {
+      throw new Error(`Commitment update failed: ${result.error?.message}`);
+    }
   }
 
   async getWebhookLogByUserAndType(userId: string, webhookType: string): Promise<WebhookLog | null> {
@@ -602,6 +777,98 @@ export class DatabaseStorage implements IStorage {
       .limit(1);
 
     return log || null;
+  }
+
+  /**
+   * Batch operation for multiple database writes with transaction safety
+   * Useful for complex operations that need atomicity
+   */
+  async executeBatchOperations(
+    operations: Array<{
+      type: 'insert' | 'update' | 'delete';
+      table: 'users' | 'sprints' | 'sprint_commitments' | 'webhook_logs';
+      data: any;
+      where?: any;
+    }>,
+    options: TransactionOptions = {}
+  ): Promise<TransactionResult<number>> {
+    return await this.executeTransaction(async (tx) => {
+      let operationCount = 0;
+
+      for (const operation of operations) {
+        switch (operation.type) {
+          case 'insert':
+            if (operation.table === 'users') {
+              await tx.insert(users).values(operation.data);
+            } else if (operation.table === 'sprints') {
+              await tx.insert(sprints).values(operation.data);
+            } else if (operation.table === 'sprint_commitments') {
+              await tx.insert(sprintCommitments).values(operation.data);
+            } else if (operation.table === 'webhook_logs') {
+              await tx.insert(webhookLogs).values(operation.data);
+            }
+            break;
+
+          case 'update':
+            if (operation.table === 'users' && operation.where) {
+              await tx.update(users).set(operation.data).where(operation.where);
+            } else if (operation.table === 'sprints' && operation.where) {
+              await tx.update(sprints).set(operation.data).where(operation.where);
+            } else if (operation.table === 'sprint_commitments' && operation.where) {
+              await tx.update(sprintCommitments).set(operation.data).where(operation.where);
+            } else if (operation.table === 'webhook_logs' && operation.where) {
+              await tx.update(webhookLogs).set(operation.data).where(operation.where);
+            }
+            break;
+
+          case 'delete':
+            if (operation.table === 'users' && operation.where) {
+              await tx.delete(users).where(operation.where);
+            } else if (operation.table === 'sprints' && operation.where) {
+              await tx.delete(sprints).where(operation.where);
+            } else if (operation.table === 'sprint_commitments' && operation.where) {
+              await tx.delete(sprintCommitments).where(operation.where);
+            } else if (operation.table === 'webhook_logs' && operation.where) {
+              await tx.delete(webhookLogs).where(operation.where);
+            }
+            break;
+        }
+        operationCount++;
+      }
+
+      return operationCount;
+    }, {
+      ...options,
+      isolationLevel: options.isolationLevel || 'repeatable read'
+    });
+  }
+
+  /**
+   * Health check method for transaction system
+   * Tests basic transaction functionality
+   */
+  async testTransactionHealth(): Promise<{ healthy: boolean; latency: number; error?: string }> {
+    const startTime = Date.now();
+    
+    try {
+      const result = await this.executeTransaction(async (tx) => {
+        // Simple test query
+        const [testResult] = await tx.execute(sql`SELECT 1 as test`);
+        return testResult;
+      }, { retries: 1, logQueries: false });
+
+      return {
+        healthy: result.success,
+        latency: Date.now() - startTime,
+        error: result.error?.message
+      };
+    } catch (error) {
+      return {
+        healthy: false,
+        latency: Date.now() - startTime,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
   }
 }
 
