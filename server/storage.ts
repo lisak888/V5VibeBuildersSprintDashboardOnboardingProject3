@@ -871,6 +871,706 @@ export class DatabaseStorage implements IStorage {
     }
   }
 
+  // ===== ROLLBACK AND ERROR RECOVERY LOGIC =====
+  // Phase 5 Task 9: Add rollback and error recovery logic
+
+  /**
+   * Error classification and recovery strategy interface
+   */
+  interface ErrorRecoveryStrategy {
+    shouldRetry: boolean;
+    retryDelay: number;
+    maxRetries: number;
+    requiresRollback: boolean;
+    requiresDataValidation: boolean;
+    customRecovery?: () => Promise<boolean>;
+  }
+
+  /**
+   * Operation context for comprehensive error tracking
+   */
+  interface OperationContext {
+    operationType: 'sprint_advancement' | 'commitment_update' | 'bulk_operation' | 'data_migration';
+    userId?: string;
+    operationId: string;
+    startTime: Date;
+    checkpoints: Array<{
+      timestamp: Date;
+      operation: string;
+      data: any;
+    }>;
+    rollbackData?: any;
+  }
+
+  /**
+   * Comprehensive error analysis and recovery strategy determination
+   */
+  private analyzeErrorAndDetermineStrategy(error: Error, context: OperationContext): ErrorRecoveryStrategy {
+    const errorMessage = error.message.toLowerCase();
+    
+    // Database constraint violations - non-recoverable
+    if (this.isConstraintViolation(error)) {
+      return {
+        shouldRetry: false,
+        retryDelay: 0,
+        maxRetries: 0,
+        requiresRollback: true,
+        requiresDataValidation: true
+      };
+    }
+
+    // Deadlock detection - recoverable with retry
+    if (errorMessage.includes('deadlock') || errorMessage.includes('serialization failure')) {
+      return {
+        shouldRetry: true,
+        retryDelay: Math.random() * 1000 + 500, // Random delay to avoid repeated conflicts
+        maxRetries: 5,
+        requiresRollback: true,
+        requiresDataValidation: false
+      };
+    }
+
+    // Connection timeout - recoverable with exponential backoff
+    if (errorMessage.includes('timeout') || errorMessage.includes('connection')) {
+      return {
+        shouldRetry: true,
+        retryDelay: 2000,
+        maxRetries: 3,
+        requiresRollback: false,
+        requiresDataValidation: true
+      };
+    }
+
+    // Resource exhaustion - recoverable with delay
+    if (errorMessage.includes('resource') || errorMessage.includes('memory') || errorMessage.includes('disk')) {
+      return {
+        shouldRetry: true,
+        retryDelay: 5000,
+        maxRetries: 2,
+        requiresRollback: true,
+        requiresDataValidation: true
+      };
+    }
+
+    // Foreign key violations - non-recoverable data issue
+    if (errorMessage.includes('foreign key') || errorMessage.includes('referential integrity')) {
+      return {
+        shouldRetry: false,
+        retryDelay: 0,
+        maxRetries: 0,
+        requiresRollback: true,
+        requiresDataValidation: true
+      };
+    }
+
+    // Network-related errors - recoverable
+    if (errorMessage.includes('network') || errorMessage.includes('connection reset')) {
+      return {
+        shouldRetry: true,
+        retryDelay: 1000,
+        maxRetries: 3,
+        requiresRollback: false,
+        requiresDataValidation: true
+      };
+    }
+
+    // Default strategy for unknown errors
+    return {
+      shouldRetry: true,
+      retryDelay: 1000,
+      maxRetries: 1,
+      requiresRollback: true,
+      requiresDataValidation: true
+    };
+  }
+
+  /**
+   * Enhanced constraint violation detection
+   */
+  private isConstraintViolation(error: Error): boolean {
+    const constraintPatterns = [
+      /check constraint/i,
+      /unique constraint/i,
+      /not null constraint/i,
+      /duplicate key/i,
+      /violates check constraint/i,
+      /value too long/i,
+      /invalid input syntax/i
+    ];
+
+    return constraintPatterns.some(pattern => pattern.test(error.message));
+  }
+
+  /**
+   * Enhanced transaction executor with comprehensive rollback and recovery
+   */
+  async executeTransactionWithRecovery<T>(
+    operationType: OperationContext['operationType'],
+    operationFn: TransactionFn<T>,
+    userId?: string,
+    options: TransactionOptions & {
+      enableRecovery?: boolean;
+      validateAfterRecovery?: boolean;
+      createBackup?: boolean;
+    } = {}
+  ): Promise<TransactionResult<T> & {
+    recoveryAttempts: number;
+    rollbackPerformed: boolean;
+    dataValidated: boolean;
+  }> {
+    const {
+      enableRecovery = true,
+      validateAfterRecovery = true,
+      createBackup = false,
+      ...transactionOptions
+    } = options;
+
+    const operationId = `${operationType}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const context: OperationContext = {
+      operationType,
+      userId,
+      operationId,
+      startTime: new Date(),
+      checkpoints: []
+    };
+
+    let recoveryAttempts = 0;
+    let rollbackPerformed = false;
+    let dataValidated = false;
+    let backup: any = null;
+
+    // Create backup if requested
+    if (createBackup && userId) {
+      try {
+        backup = await this.createOperationBackup(userId, operationType);
+        context.rollbackData = backup;
+      } catch (backupError) {
+        console.warn(`[RECOVERY] Failed to create backup for ${operationId}:`, backupError);
+      }
+    }
+
+    const startTime = Date.now();
+    let lastError: Error | undefined;
+
+    // Main execution loop with recovery
+    while (recoveryAttempts <= (transactionOptions.retries || 3)) {
+      try {
+        // Add checkpoint
+        context.checkpoints.push({
+          timestamp: new Date(),
+          operation: `attempt_${recoveryAttempts + 1}`,
+          data: { attempt: recoveryAttempts + 1 }
+        });
+
+        // Execute transaction
+        const result = await this.executeTransaction(operationFn, {
+          ...transactionOptions,
+          retries: 0, // Handle retries at this level
+          logQueries: transactionOptions.logQueries || recoveryAttempts > 0
+        });
+
+        if (result.success) {
+          // Success - validate if requested
+          if (validateAfterRecovery && userId) {
+            try {
+              dataValidated = await this.validateOperationResult(userId, operationType, context);
+              if (!dataValidated) {
+                throw new Error('Post-operation data validation failed');
+              }
+            } catch (validationError) {
+              console.error(`[RECOVERY] Validation failed for ${operationId}:`, validationError);
+              lastError = validationError instanceof Error ? validationError : new Error(String(validationError));
+              recoveryAttempts++;
+              continue;
+            }
+          }
+
+          return {
+            ...result,
+            recoveryAttempts,
+            rollbackPerformed,
+            dataValidated
+          };
+        }
+
+        lastError = result.error;
+        break; // Transaction wrapper handles its own retries
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        
+        if (!enableRecovery) {
+          break;
+        }
+
+        // Analyze error and determine recovery strategy
+        const strategy = this.analyzeErrorAndDetermineStrategy(lastError, context);
+        
+        console.warn(`[RECOVERY] Attempt ${recoveryAttempts + 1} failed for ${operationId}: ${lastError.message}`);
+
+        // Perform rollback if required
+        if (strategy.requiresRollback && backup && userId) {
+          try {
+            await this.performOperationRollback(userId, operationType, backup, context);
+            rollbackPerformed = true;
+            console.log(`[RECOVERY] Rollback completed for ${operationId}`);
+          } catch (rollbackError) {
+            console.error(`[RECOVERY] Rollback failed for ${operationId}:`, rollbackError);
+            // Continue with recovery attempt even if rollback fails
+          }
+        }
+
+        // Check if we should retry
+        if (!strategy.shouldRetry || recoveryAttempts >= strategy.maxRetries) {
+          break;
+        }
+
+        // Wait before retry with strategy-specific delay
+        if (strategy.retryDelay > 0) {
+          await new Promise(resolve => setTimeout(resolve, strategy.retryDelay));
+        }
+
+        recoveryAttempts++;
+      }
+    }
+
+    // All recovery attempts failed
+    const duration = Date.now() - startTime;
+    
+    console.error(`[RECOVERY] All recovery attempts failed for ${operationId} after ${duration}ms:`, lastError?.message);
+
+    return {
+      success: false,
+      error: lastError,
+      duration,
+      retryCount: recoveryAttempts,
+      recoveryAttempts,
+      rollbackPerformed,
+      dataValidated
+    };
+  }
+
+  /**
+   * Create operation backup for rollback capability
+   */
+  private async createOperationBackup(
+    userId: string, 
+    operationType: OperationContext['operationType']
+  ): Promise<any> {
+    switch (operationType) {
+      case 'sprint_advancement':
+        return await this.createSprintAdvancementBackup(userId);
+      
+      case 'commitment_update':
+        // Get current sprint commitments state
+        const sprints = await this.getUserSprints(userId);
+        const commitments = await this.getSprintCommitments(userId);
+        return { sprints, commitments };
+      
+      case 'bulk_operation':
+        // Create comprehensive backup
+        return await this.createComprehensiveBackup(userId);
+      
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Perform operation rollback based on backup data
+   */
+  private async performOperationRollback(
+    userId: string,
+    operationType: OperationContext['operationType'],
+    backupData: any,
+    context: OperationContext
+  ): Promise<void> {
+    const rollbackResult = await this.executeTransaction(async (tx) => {
+      context.checkpoints.push({
+        timestamp: new Date(),
+        operation: 'rollback_start',
+        data: { operationType }
+      });
+
+      switch (operationType) {
+        case 'sprint_advancement':
+          return await this.performSprintAdvancementRollback(tx, userId, backupData);
+        
+        case 'commitment_update':
+          return await this.performCommitmentUpdateRollback(tx, userId, backupData);
+        
+        case 'bulk_operation':
+          return await this.performBulkOperationRollback(tx, userId, backupData);
+        
+        default:
+          throw new Error(`Rollback not implemented for operation type: ${operationType}`);
+      }
+    }, {
+      retries: 2,
+      isolationLevel: 'serializable',
+      timeout: 60000,
+      logQueries: true
+    });
+
+    if (!rollbackResult.success) {
+      throw new Error(`Rollback failed: ${rollbackResult.error?.message}`);
+    }
+
+    context.checkpoints.push({
+      timestamp: new Date(),
+      operation: 'rollback_complete',
+      data: { success: true }
+    });
+  }
+
+  /**
+   * Sprint advancement specific rollback
+   */
+  private async performSprintAdvancementRollback(
+    tx: any,
+    userId: string,
+    backupData: any
+  ): Promise<boolean> {
+    // Delete current sprint data
+    await tx.delete(sprintCommitments).where(eq(sprintCommitments.userId, userId));
+    await tx.delete(webhookLogs).where(eq(webhookLogs.userId, userId));
+    await tx.delete(sprints).where(eq(sprints.userId, userId));
+
+    // Restore from backup
+    for (const sprint of backupData.sprints) {
+      await tx.insert(sprints).values({
+        id: sprint.id,
+        userId,
+        sprintNumber: sprint.sprintNumber,
+        startDate: new Date(), // Will be recalculated
+        endDate: new Date(),
+        type: sprint.type,
+        description: sprint.description,
+        status: sprint.status,
+      });
+    }
+
+    for (const commitment of backupData.commitments) {
+      await tx.insert(sprintCommitments).values({
+        id: commitment.id,
+        userId,
+        sprintId: commitment.sprintId,
+        type: commitment.type,
+        description: commitment.description,
+        isNewCommitment: false,
+      });
+    }
+
+    return true;
+  }
+
+  /**
+   * Commitment update specific rollback
+   */
+  private async performCommitmentUpdateRollback(
+    tx: any,
+    userId: string,
+    backupData: any
+  ): Promise<boolean> {
+    // Restore sprint states
+    for (const sprint of backupData.sprints) {
+      await tx
+        .update(sprints)
+        .set({
+          type: sprint.type,
+          description: sprint.description,
+          updatedAt: new Date()
+        })
+        .where(eq(sprints.id, sprint.id));
+    }
+
+    // Remove any new commitment records
+    const backupCommitmentIds = backupData.commitments.map((c: any) => c.id);
+    if (backupCommitmentIds.length > 0) {
+      await tx
+        .delete(sprintCommitments)
+        .where(
+          and(
+            eq(sprintCommitments.userId, userId),
+            sql`${sprintCommitments.id} NOT IN (${backupCommitmentIds.map(() => '?').join(',')})`,
+            ...backupCommitmentIds
+          )
+        );
+    }
+
+    return true;
+  }
+
+  /**
+   * Bulk operation specific rollback
+   */
+  private async performBulkOperationRollback(
+    tx: any,
+    userId: string,
+    backupData: any
+  ): Promise<boolean> {
+    // Comprehensive restore for bulk operations
+    await this.performSprintAdvancementRollback(tx, userId, backupData);
+    return true;
+  }
+
+  /**
+   * Validate operation result for data consistency
+   */
+  private async validateOperationResult(
+    userId: string,
+    operationType: OperationContext['operationType'],
+    context: OperationContext
+  ): Promise<boolean> {
+    try {
+      switch (operationType) {
+        case 'sprint_advancement':
+          const sprintIntegrity = await this.verifySprintAdvancementIntegrity(userId);
+          return sprintIntegrity.isValid;
+        
+        case 'commitment_update':
+          return await this.validateCommitmentUpdateResult(userId);
+        
+        case 'bulk_operation':
+          return await this.validateBulkOperationResult(userId);
+        
+        default:
+          return true; // No validation implemented
+      }
+    } catch (error) {
+      console.error(`[RECOVERY] Validation error for ${context.operationId}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Validate commitment update results
+   */
+  private async validateCommitmentUpdateResult(userId: string): Promise<boolean> {
+    // Check for orphaned commitments
+    const orphanedCommitments = await db
+      .select({ count: sql<number>`count(*)`.as('count') })
+      .from(sprintCommitments)
+      .leftJoin(sprints, eq(sprintCommitments.sprintId, sprints.id))
+      .where(
+        and(
+          eq(sprintCommitments.userId, userId),
+          sql`${sprints.id} IS NULL`
+        )
+      );
+
+    if (Number(orphanedCommitments[0]?.count || 0) > 0) {
+      return false;
+    }
+
+    // Check sprint consistency
+    const futureSprints = await this.getSprintsByStatus(userId, "future");
+    return futureSprints.length === 6;
+  }
+
+  /**
+   * Validate bulk operation results
+   */
+  private async validateBulkOperationResult(userId: string): Promise<boolean> {
+    const sprintValidation = await this.validateCommitmentUpdateResult(userId);
+    const integrityCheck = await this.verifySprintAdvancementIntegrity(userId);
+    
+    return sprintValidation && integrityCheck.isValid;
+  }
+
+  /**
+   * Create comprehensive backup for complex operations
+   */
+  private async createComprehensiveBackup(userId: string): Promise<any> {
+    const [sprints, commitments, webhookLogs] = await Promise.all([
+      this.getUserSprints(userId),
+      this.getSprintCommitments(userId),
+      this.getWebhookLogs(userId)
+    ]);
+
+    return {
+      sprints: sprints.map(s => ({
+        id: s.id,
+        sprintNumber: s.sprintNumber,
+        status: s.status,
+        type: s.type,
+        description: s.description,
+        startDate: s.startDate,
+        endDate: s.endDate
+      })),
+      commitments: commitments.map(c => ({
+        id: c.id,
+        sprintId: c.sprintId,
+        type: c.type,
+        description: c.description,
+        isNewCommitment: c.isNewCommitment
+      })),
+      webhookLogs: webhookLogs.map(w => ({
+        id: w.id,
+        sprintId: w.sprintId,
+        webhookType: w.webhookType,
+        status: w.status,
+        payload: w.payload
+      }))
+    };
+  }
+
+  /**
+   * Enhanced atomic sprint advancement with recovery
+   */
+  async executeAtomicSprintAdvancementWithRecovery(
+    userId: string,
+    operations: {
+      currentSprintNumber: number;
+      sprintStatusMap: Map<number, "historic" | "current" | "future">;
+      newSprintsToCreate: Array<{
+        sprintNumber: number;
+        startDate: Date;
+        endDate: Date;
+        status: "historic" | "current" | "future";
+      }>;
+      sprintsToCleanup: number[];
+    }
+  ): Promise<{
+    success: boolean;
+    sprintsUpdated: number;
+    sprintsCreated: number;
+    sprintsDeleted: number;
+    recoveryAttempts: number;
+    rollbackPerformed: boolean;
+    error?: string;
+  }> {
+    const result = await this.executeTransactionWithRecovery(
+      'sprint_advancement',
+      async (tx) => {
+        return await this.performAtomicSprintAdvancementOperations(tx, userId, operations);
+      },
+      userId,
+      {
+        enableRecovery: true,
+        validateAfterRecovery: true,
+        createBackup: true,
+        retries: 3,
+        isolationLevel: 'repeatable read',
+        timeout: 45000
+      }
+    );
+
+    if (!result.success) {
+      return {
+        success: false,
+        sprintsUpdated: 0,
+        sprintsCreated: 0,
+        sprintsDeleted: 0,
+        recoveryAttempts: result.recoveryAttempts,
+        rollbackPerformed: result.rollbackPerformed,
+        error: result.error?.message || 'Unknown error'
+      };
+    }
+
+    return {
+      success: true,
+      ...result.data!,
+      recoveryAttempts: result.recoveryAttempts,
+      rollbackPerformed: result.rollbackPerformed
+    };
+  }
+
+  /**
+   * Extract atomic sprint advancement operations for reuse
+   */
+  private async performAtomicSprintAdvancementOperations(
+    tx: any,
+    userId: string,
+    operations: {
+      currentSprintNumber: number;
+      sprintStatusMap: Map<number, "historic" | "current" | "future">;
+      newSprintsToCreate: Array<{
+        sprintNumber: number;
+        startDate: Date;
+        endDate: Date;
+        status: "historic" | "current" | "future";
+      }>;
+      sprintsToCleanup: number[];
+    }
+  ) {
+    let sprintsUpdated = 0;
+    let sprintsCreated = 0;
+    let sprintsDeleted = 0;
+
+    // Get existing sprints with row-level locking
+    const existingSprints = await tx
+      .select()
+      .from(sprints)
+      .where(eq(sprints.userId, userId))
+      .for('update');
+
+    const existingSprintMap = new Map(
+      existingSprints.map((sprint: any) => [sprint.sprintNumber, sprint])
+    );
+
+    // Update sprint statuses
+    for (const [sprintNumber, newStatus] of operations.sprintStatusMap.entries()) {
+      const existingSprint = existingSprintMap.get(sprintNumber);
+      
+      if (existingSprint && existingSprint.status !== newStatus) {
+        await tx
+          .update(sprints)
+          .set({ 
+            status: newStatus, 
+            updatedAt: new Date() 
+          })
+          .where(eq(sprints.id, existingSprint.id));
+        
+        sprintsUpdated++;
+      }
+    }
+
+    // Create new sprints
+    for (const newSprint of operations.newSprintsToCreate) {
+      if (!existingSprintMap.has(newSprint.sprintNumber)) {
+        await tx
+          .insert(sprints)
+          .values({
+            userId,
+            sprintNumber: newSprint.sprintNumber,
+            startDate: newSprint.startDate,
+            endDate: newSprint.endDate,
+            type: null,
+            description: null,
+            status: newSprint.status,
+          });
+        
+        sprintsCreated++;
+      }
+    }
+
+    // Clean up old sprints
+    for (const sprintNumber of operations.sprintsToCleanup) {
+      const sprintToDelete = existingSprintMap.get(sprintNumber);
+      
+      if (sprintToDelete) {
+        await tx.delete(sprintCommitments).where(eq(sprintCommitments.sprintId, sprintToDelete.id));
+        await tx.delete(webhookLogs).where(eq(webhookLogs.sprintId, sprintToDelete.id));
+        await tx.delete(sprints).where(eq(sprints.id, sprintToDelete.id));
+        
+        sprintsDeleted++;
+      }
+    }
+
+    // Final validation
+    const finalSprintCount = await tx
+      .select({ count: sql<number>`count(*)`.as('count') })
+      .from(sprints)
+      .where(eq(sprints.userId, userId));
+
+    const expectedCount = existingSprints.length + sprintsCreated - sprintsDeleted;
+    if (Number(finalSprintCount[0]?.count || 0) !== expectedCount) {
+      throw new Error(`Sprint count mismatch: expected ${expectedCount}, got ${finalSprintCount[0]?.count}`);
+    }
+
+    return { sprintsUpdated, sprintsCreated, sprintsDeleted };
+  }
+
   // ===== ATOMIC SPRINT ADVANCEMENT OPERATIONS =====
   // Phase 5 Task 8: Create atomic sprint advancement operations
 
