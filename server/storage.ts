@@ -393,16 +393,16 @@ export class DatabaseStorage implements IStorage {
     }
 
     // Get all sprints with optimized query using user index
-    const sprints = await db
+    const sprintData = await db
       .select()
-      .from(sprints as any)
+      .from(sprints)
       .where(eq(sprints.userId, userId))
       .orderBy(asc(sprints.sprintNumber));
 
     // Get all commitments in a single query
     const commitments = await this.getSprintCommitments(userId);
 
-    return { user, sprints, commitments };
+    return { user, sprints: sprintData, commitments };
   }
 
   /**
@@ -869,6 +869,445 @@ export class DatabaseStorage implements IStorage {
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
+  }
+
+  // ===== ATOMIC SPRINT ADVANCEMENT OPERATIONS =====
+  // Phase 5 Task 8: Create atomic sprint advancement operations
+
+  /**
+   * Atomic operation to advance all sprints for a single user
+   * Handles the complete sprint transition lifecycle with rollback capability
+   */
+  async executeAtomicSprintAdvancement(
+    userId: string,
+    operations: {
+      currentSprintNumber: number;
+      sprintStatusMap: Map<number, "historic" | "current" | "future">;
+      newSprintsToCreate: Array<{
+        sprintNumber: number;
+        startDate: Date;
+        endDate: Date;
+        status: "historic" | "current" | "future";
+      }>;
+      sprintsToCleanup: number[];
+    }
+  ): Promise<{
+    success: boolean;
+    sprintsUpdated: number;
+    sprintsCreated: number;
+    sprintsDeleted: number;
+    error?: string;
+  }> {
+    const result = await this.executeTransaction(async (tx) => {
+      let sprintsUpdated = 0;
+      let sprintsCreated = 0;
+      let sprintsDeleted = 0;
+
+      // Step 1: Get all existing sprints for the user with row-level locking
+      const existingSprints = await tx
+        .select()
+        .from(sprints)
+        .where(eq(sprints.userId, userId))
+        .for('update'); // Prevent concurrent modifications
+
+      const existingSprintMap = new Map(
+        existingSprints.map(sprint => [sprint.sprintNumber, sprint])
+      );
+
+      // Step 2: Update sprint statuses atomically
+      for (const [sprintNumber, newStatus] of operations.sprintStatusMap.entries()) {
+        const existingSprint = existingSprintMap.get(sprintNumber);
+        
+        if (existingSprint && existingSprint.status !== newStatus) {
+          await tx
+            .update(sprints)
+            .set({ 
+              status: newStatus, 
+              updatedAt: new Date() 
+            })
+            .where(eq(sprints.id, existingSprint.id));
+          
+          sprintsUpdated++;
+        }
+      }
+
+      // Step 3: Create new future sprints atomically
+      for (const newSprint of operations.newSprintsToCreate) {
+        if (!existingSprintMap.has(newSprint.sprintNumber)) {
+          await tx
+            .insert(sprints)
+            .values({
+              userId,
+              sprintNumber: newSprint.sprintNumber,
+              startDate: newSprint.startDate,
+              endDate: newSprint.endDate,
+              type: null, // New sprints start uncommitted
+              description: null,
+              status: newSprint.status,
+            });
+          
+          sprintsCreated++;
+        }
+      }
+
+      // Step 4: Clean up old historic sprints atomically
+      for (const sprintNumber of operations.sprintsToCleanup) {
+        const sprintToDelete = existingSprintMap.get(sprintNumber);
+        
+        if (sprintToDelete) {
+          // Delete related sprint commitments first (cascade)
+          await tx
+            .delete(sprintCommitments)
+            .where(eq(sprintCommitments.sprintId, sprintToDelete.id));
+
+          // Delete related webhook logs (cascade)
+          await tx
+            .delete(webhookLogs)
+            .where(eq(webhookLogs.sprintId, sprintToDelete.id));
+
+          // Delete the sprint itself
+          await tx
+            .delete(sprints)
+            .where(eq(sprints.id, sprintToDelete.id));
+          
+          sprintsDeleted++;
+        }
+      }
+
+      // Step 5: Validate data consistency post-transaction
+      const finalSprintCount = await tx
+        .select({ count: sql<number>`count(*)`.as('count') })
+        .from(sprints)
+        .where(eq(sprints.userId, userId));
+
+      const expectedCount = existingSprints.length + sprintsCreated - sprintsDeleted;
+      if (Number(finalSprintCount[0]?.count || 0) !== expectedCount) {
+        throw new Error(`Sprint count mismatch: expected ${expectedCount}, got ${finalSprintCount[0]?.count}`);
+      }
+
+      return { sprintsUpdated, sprintsCreated, sprintsDeleted };
+    }, {
+      retries: 3,
+      isolationLevel: 'repeatable read',
+      timeout: 45000, // Longer timeout for complex operations
+      logQueries: true
+    });
+
+    if (!result.success) {
+      return {
+        success: false,
+        sprintsUpdated: 0,
+        sprintsCreated: 0,
+        sprintsDeleted: 0,
+        error: result.error?.message || 'Unknown transaction error'
+      };
+    }
+
+    return {
+      success: true,
+      ...result.data!
+    };
+  }
+
+  /**
+   * Atomic bulk sprint advancement for all users
+   * Processes multiple users with individual transaction isolation
+   */
+  async executeBulkSprintAdvancement(
+    userOperations: Array<{
+      userId: string;
+      username: string;
+      operations: {
+        currentSprintNumber: number;
+        sprintStatusMap: Map<number, "historic" | "current" | "future">;
+        newSprintsToCreate: Array<{
+          sprintNumber: number;
+          startDate: Date;
+          endDate: Date;
+          status: "historic" | "current" | "future";
+        }>;
+        sprintsToCleanup: number[];
+      };
+    }>
+  ): Promise<{
+    totalUsersProcessed: number;
+    totalSprintsUpdated: number;
+    totalSprintsCreated: number;
+    totalSprintsDeleted: number;
+    failedUsers: Array<{ username: string; error: string }>;
+    processingTimeMs: number;
+  }> {
+    const startTime = Date.now();
+    let totalUsersProcessed = 0;
+    let totalSprintsUpdated = 0;
+    let totalSprintsCreated = 0;
+    let totalSprintsDeleted = 0;
+    const failedUsers: Array<{ username: string; error: string }> = [];
+
+    // Process each user individually to ensure isolation
+    for (const userOp of userOperations) {
+      try {
+        const result = await this.executeAtomicSprintAdvancement(
+          userOp.userId,
+          userOp.operations
+        );
+
+        if (result.success) {
+          totalUsersProcessed++;
+          totalSprintsUpdated += result.sprintsUpdated;
+          totalSprintsCreated += result.sprintsCreated;
+          totalSprintsDeleted += result.sprintsDeleted;
+        } else {
+          failedUsers.push({
+            username: userOp.username,
+            error: result.error || 'Unknown error'
+          });
+        }
+      } catch (error) {
+        failedUsers.push({
+          username: userOp.username,
+          error: error instanceof Error ? error.message : 'Unexpected error'
+        });
+      }
+    }
+
+    return {
+      totalUsersProcessed,
+      totalSprintsUpdated,
+      totalSprintsCreated,
+      totalSprintsDeleted,
+      failedUsers,
+      processingTimeMs: Date.now() - startTime
+    };
+  }
+
+  /**
+   * Atomic operation to verify sprint advancement integrity
+   * Checks data consistency after sprint transitions
+   */
+  async verifySprintAdvancementIntegrity(userId: string): Promise<{
+    isValid: boolean;
+    issues: string[];
+    sprintCounts: {
+      historic: number;
+      current: number;
+      future: number;
+      total: number;
+    };
+  }> {
+    const result = await this.executeTransaction(async (tx) => {
+      const issues: string[] = [];
+
+      // Get all sprints for the user
+      const allSprints = await tx
+        .select()
+        .from(sprints)
+        .where(eq(sprints.userId, userId))
+        .orderBy(asc(sprints.sprintNumber));
+
+      // Count sprints by status
+      const sprintCounts = {
+        historic: allSprints.filter(s => s.status === 'historic').length,
+        current: allSprints.filter(s => s.status === 'current').length,
+        future: allSprints.filter(s => s.status === 'future').length,
+        total: allSprints.length
+      };
+
+      // Validation checks
+      if (sprintCounts.current !== 1) {
+        issues.push(`Expected exactly 1 current sprint, found ${sprintCounts.current}`);
+      }
+
+      if (sprintCounts.future !== 6) {
+        issues.push(`Expected exactly 6 future sprints, found ${sprintCounts.future}`);
+      }
+
+      if (sprintCounts.historic > 24) {
+        issues.push(`Too many historic sprints: ${sprintCounts.historic} (max 24)`);
+      }
+
+      // Check for duplicate sprint numbers
+      const sprintNumbers = allSprints.map(s => s.sprintNumber);
+      const uniqueNumbers = new Set(sprintNumbers);
+      if (sprintNumbers.length !== uniqueNumbers.size) {
+        issues.push('Duplicate sprint numbers detected');
+      }
+
+      // Check for gaps in sprint sequence
+      const sortedNumbers = [...uniqueNumbers].sort((a, b) => a - b);
+      for (let i = 1; i < sortedNumbers.length; i++) {
+        if (sortedNumbers[i] !== sortedNumbers[i - 1] + 1) {
+          issues.push(`Gap in sprint sequence between ${sortedNumbers[i - 1]} and ${sortedNumbers[i]}`);
+        }
+      }
+
+      // Check sprint date consistency
+      for (const sprint of allSprints) {
+        if (sprint.endDate <= sprint.startDate) {
+          issues.push(`Sprint ${sprint.sprintNumber} has invalid date range`);
+        }
+      }
+
+      // Check orphaned commitments
+      const orphanedCommitments = await tx
+        .select({ count: sql<number>`count(*)`.as('count') })
+        .from(sprintCommitments)
+        .leftJoin(sprints, eq(sprintCommitments.sprintId, sprints.id))
+        .where(
+          and(
+            eq(sprintCommitments.userId, userId),
+            sql`${sprints.id} IS NULL`
+          )
+        );
+
+      if (Number(orphanedCommitments[0]?.count || 0) > 0) {
+        issues.push(`Found ${orphanedCommitments[0]?.count} orphaned commitments`);
+      }
+
+      return { issues, sprintCounts };
+    }, {
+      retries: 1,
+      isolationLevel: 'read committed',
+      logQueries: false
+    });
+
+    if (!result.success) {
+      return {
+        isValid: false,
+        issues: [`Transaction failed: ${result.error?.message}`],
+        sprintCounts: { historic: 0, current: 0, future: 0, total: 0 }
+      };
+    }
+
+    return {
+      isValid: result.data!.issues.length === 0,
+      issues: result.data!.issues,
+      sprintCounts: result.data!.sprintCounts
+    };
+  }
+
+  /**
+   * Atomic rollback operation for failed sprint advancements
+   * Restores sprint data to a previous consistent state
+   */
+  async executeSprintAdvancementRollback(
+    userId: string,
+    backupData: {
+      sprints: Array<{
+        id: string;
+        sprintNumber: number;
+        status: "historic" | "current" | "future";
+        type: "build" | "test" | "pto" | null;
+        description: string | null;
+      }>;
+      commitments: Array<{
+        id: string;
+        sprintId: string;
+        type: "build" | "test" | "pto";
+        description: string | null;
+      }>;
+    }
+  ): Promise<{ success: boolean; error?: string }> {
+    const result = await this.executeTransaction(async (tx) => {
+      // Step 1: Delete all current sprint data
+      await tx
+        .delete(sprintCommitments)
+        .where(eq(sprintCommitments.userId, userId));
+
+      await tx
+        .delete(sprints)
+        .where(eq(sprints.userId, userId));
+
+      // Step 2: Restore sprint data from backup
+      for (const sprintBackup of backupData.sprints) {
+        await tx
+          .insert(sprints)
+          .values({
+            id: sprintBackup.id,
+            userId,
+            sprintNumber: sprintBackup.sprintNumber,
+            startDate: new Date(), // Will be recalculated
+            endDate: new Date(),   // Will be recalculated
+            type: sprintBackup.type,
+            description: sprintBackup.description,
+            status: sprintBackup.status,
+          });
+      }
+
+      // Step 3: Restore commitment data from backup
+      for (const commitmentBackup of backupData.commitments) {
+        await tx
+          .insert(sprintCommitments)
+          .values({
+            id: commitmentBackup.id,
+            userId,
+            sprintId: commitmentBackup.sprintId,
+            type: commitmentBackup.type,
+            description: commitmentBackup.description,
+            isNewCommitment: false,
+          });
+      }
+
+      return true;
+    }, {
+      retries: 2,
+      isolationLevel: 'serializable',
+      timeout: 60000,
+      logQueries: true
+    });
+
+    return {
+      success: result.success,
+      error: result.error?.message
+    };
+  }
+
+  /**
+   * Create a backup snapshot of user's sprint data before advancement
+   * Used for rollback capability
+   */
+  async createSprintAdvancementBackup(userId: string): Promise<{
+    sprints: Array<{
+      id: string;
+      sprintNumber: number;
+      status: "historic" | "current" | "future";
+      type: "build" | "test" | "pto" | null;
+      description: string | null;
+    }>;
+    commitments: Array<{
+      id: string;
+      sprintId: string;
+      type: "build" | "test" | "pto";
+      description: string | null;
+    }>;
+  }> {
+    const [sprintData, commitmentData] = await Promise.all([
+      db
+        .select({
+          id: sprints.id,
+          sprintNumber: sprints.sprintNumber,
+          status: sprints.status,
+          type: sprints.type,
+          description: sprints.description,
+        })
+        .from(sprints)
+        .where(eq(sprints.userId, userId)),
+      
+      db
+        .select({
+          id: sprintCommitments.id,
+          sprintId: sprintCommitments.sprintId,
+          type: sprintCommitments.type,
+          description: sprintCommitments.description,
+        })
+        .from(sprintCommitments)
+        .where(eq(sprintCommitments.userId, userId))
+    ]);
+
+    return {
+      sprints: sprintData,
+      commitments: commitmentData
+    };
   }
 }
 
