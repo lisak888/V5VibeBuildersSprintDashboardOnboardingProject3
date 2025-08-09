@@ -7,9 +7,10 @@ import { StateChangeDetector } from "./services/stateChangeDetector";
 import { updateSprintCommitmentsSchema } from "@shared/schema";
 import { z } from "zod";
 import completionRouter from "./routes/completion";
+import { sendWebhook } from "./utils/webhookService";
 
 export async function registerRoutes(app: Express): Promise<Server> {
-  
+
   // Mount the dashboard completion webhook router
   app.use('/api/dashboard-complete', completionRouter);
 
@@ -139,69 +140,46 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Execute all commitment updates in a single transaction
       await storage.executeCommitmentUpdate(user.id, commitmentUpdates, newCommitmentData);
 
-      // Prepare webhook records for response
-      const newCommitmentRecords: Array<{ sprint: any; commitment: any }> = changeResult.webhookTriggers.map(trigger => ({
-        sprint: trigger.sprint,
-        commitment: {
-          userId: user.id,
-          sprintId: trigger.sprintId,
-          type: trigger.commitment.type,
-          description: trigger.commitment.description || null,
-          isNewCommitment: true,
+      // Send sequential webhooks for new commitments
+      if (changeResult.newCommitments.length > 0) {
+        const sprintReminderHookUrl = process.env.SPRINT_REMINDER_HOOK_URL;
+
+        if (sprintReminderHookUrl) {
+          for (const webhookTrigger of changeResult.webhookTriggers) {
+            try {
+              // Construct the webhook payload
+              const payload = {
+                user_name: username,
+                sprint_start_date: webhookTrigger.sprint.startDate.toISOString().split('T')[0], // YYYY-MM-DD format
+                sprint_type: webhookTrigger.commitment.type.charAt(0).toUpperCase() + webhookTrigger.commitment.type.slice(1), // Capitalize first letter
+                ...(webhookTrigger.commitment.description && { description: webhookTrigger.commitment.description }),
+                dashboard_url: `${process.env.REPL_URL || 'http://localhost:5000'}/dashboard/${username}`,
+                timestamp: new Date().toISOString()
+              };
+
+              // Send webhook for this specific commitment
+              const success = await sendWebhook(sprintReminderHookUrl, payload);
+
+              if (success) {
+                console.log(`New commitment webhook sent successfully for sprint ${webhookTrigger.sprint.sprintNumber}`);
+              } else {
+                console.error(`Failed to send new commitment webhook for sprint ${webhookTrigger.sprint.sprintNumber}`);
+              }
+            } catch (webhookError) {
+              console.error(`Error sending webhook for sprint ${webhookTrigger.sprint.sprintNumber}:`, webhookError);
+            }
+          }
+        } else {
+          console.warn('SPRINT_REMINDER_HOOK_URL environment variable not set, skipping webhook notifications');
         }
-      }));
-
-      // Send webhooks for new commitments sequentially
-      if (newCommitmentRecords.length > 0) {
-        const webhookResults = await WebhookService.sendNewCommitmentWebhooks(
-          user.id,
-          user.username,
-          newCommitmentRecords
-        );
-
-        console.log(`Sent ${webhookResults.sent} webhooks, ${webhookResults.failed} failed`);
       }
 
-      // Check for dashboard completion after commitment updates
-      const completionSent = await WebhookService.checkDashboardCompletion(user.id, user.username);
-      if (completionSent) {
-        console.log(`Dashboard completion webhook sent for user ${user.username}`);
-      }
-
-      // Get updated data using efficient query
-      const futureSprints = await storage.getSprintsByStatus(user.id, "future");
-      const futureSprintNumbers = futureSprints.map(s => s.sprintNumber);
-      const validationData = await storage.getValidationData(user.id, futureSprintNumbers);
-
-      const { commitmentCounts } = validationData;
-      const isValid = commitmentCounts.build >= 2 && commitmentCounts.pto <= 2;
-
-      const changeSummary = StateChangeDetector.getChangeSummary(changeResult);
-
-      res.json({
-        success: true,
-        newCommitments: changeSummary.newCommitments,
-        webhooksSent: newCommitmentRecords.length,
-        changes: {
-          hasChanges: changeResult.hasChanges,
-          totalChanges: changeSummary.totalChanges,
-          newCommitments: changeSummary.newCommitments,
-          typeChanges: changeSummary.typeChanges,
-          descriptionChanges: changeSummary.descriptionChanges,
-          removals: changeSummary.removals,
-        },
-        validation: {
-          isValid,
-          buildCount,
-          ptoCount,
-          errors: isValid ? [] : [
-            buildCount < 2 ? "Minimum 2 Build sprints required in 6-sprint window" : null,
-            ptoCount > 2 ? "Maximum 2 PTO sprints allowed in 6-sprint window" : null,
-          ].filter(Boolean),
-        },
-      });
+      res.json({ message: "Commitments updated successfully" });
     } catch (error) {
       console.error("Error updating commitments:", error);
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid request data", errors: error.errors });
+      }
       res.status(500).json({ message: "Failed to update commitments" });
     }
   });
