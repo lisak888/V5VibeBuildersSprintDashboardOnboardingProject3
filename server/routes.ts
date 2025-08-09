@@ -187,130 +187,72 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Sprint transition API endpoint (called by Make.com)
   app.post("/api/advance-sprint", async (req, res) => {
     try {
+      // Enhanced security check for Make.com authentication
       const authHeader = req.headers.authorization;
-      const expectedToken = process.env.SPRINT_TRANSITION_TOKEN || "default-token";
+      const expectedToken = process.env.ADVANCE_SPRINT_SECRET || process.env.SPRINT_TRANSITION_TOKEN || "default-token";
 
-      if (!authHeader || authHeader !== `Bearer ${expectedToken}`) {
-        return res.status(401).json({ message: "Unauthorized" });
+      if (!authHeader || !authHeader.startsWith('Bearer ') || authHeader !== `Bearer ${expectedToken}`) {
+        console.warn(`[SECURITY] Unauthorized sprint advancement attempt from IP: ${req.ip}`);
+        return res.status(401).json({ 
+          success: false,
+          message: "Unauthorized - Invalid or missing authentication token" 
+        });
       }
 
-      // Get current sprint calculations
-      const sprintNumbers = SprintCalculator.getAllRelevantSprintNumbers();
-      const currentSprintNumber = SprintCalculator.getCurrentSprintNumber();
-
-      console.log(`Starting sprint transition to sprint ${currentSprintNumber}`);
+      console.log(`[SPRINT-TRANSITION] Starting global sprint advancement process`);
 
       // Get all users to process their sprints
       const allUsers = await storage.getAllUsers();
-      let totalSprintsProcessed = 0;
-      let usersProcessed = 0;
+      let totalUsersProcessed = 0;
+      let totalSprintsUpdated = 0;
       let failedUsers: Array<{ username: string; error: string }> = [];
 
+      // Process each user individually with proper error isolation
       for (const user of allUsers) {
         try {
-          // Get user's existing sprints
-          const userSprints = await storage.getUserSprints(user.id);
-
-          // Prepare transaction operations
-          const statusUpdates: Array<{ sprintId: string; status: "historic" | "current" | "future" }> = [];
-          const newSprints: Array<{
-            sprintNumber: number;
-            startDate: Date;
-            endDate: Date;
-            type: "build" | "test" | "pto" | null;
-            description: string | null;
-            status: "historic" | "current" | "future";
-          }> = [];
-          const sprintsToDelete: string[] = [];
-
-          // Collect sprint status updates
-          for (const sprint of userSprints) {
-            const sprintInfo = SprintCalculator.getSprintInfo(sprint.sprintNumber);
-
-            if (sprint.status !== sprintInfo.status) {
-              statusUpdates.push({
-                sprintId: sprint.id,
-                status: sprintInfo.status
-              });
-            }
-          }
-
-          // Collect new sprints to create
-          const existingSprintNumbers = new Set(userSprints.map(s => s.sprintNumber));
-          const allRequiredSprints = [
-            ...sprintNumbers.historic,
-            sprintNumbers.current,
-            ...sprintNumbers.future
-          ];
-
-          const missingSprintNumbers = allRequiredSprints.filter(num => !existingSprintNumbers.has(num));
-
-          for (const sprintNumber of missingSprintNumbers) {
-            const sprintInfo = SprintCalculator.getSprintInfo(sprintNumber);
-            newSprints.push({
-              sprintNumber,
-              startDate: sprintInfo.startDate,
-              endDate: sprintInfo.endDate,
-              type: null, // New future sprints start uncommitted
-              description: null,
-              status: sprintInfo.status,
+          const userResult = await advanceSprints(user.id);
+          
+          if (userResult.success) {
+            totalUsersProcessed++;
+            totalSprintsUpdated += userResult.sprintsUpdated;
+            console.log(`[SPRINT-TRANSITION] Successfully processed user ${user.username}: ${userResult.sprintsUpdated} sprints updated`);
+          } else {
+            failedUsers.push({
+              username: user.username,
+              error: userResult.error || "Unknown error during sprint advancement"
             });
+            console.error(`[SPRINT-TRANSITION] Failed to process user ${user.username}: ${userResult.error}`);
           }
-
-          // Collect old historic sprints to remove
-          const historicSprints = userSprints
-            .filter(s => s.status === 'historic')
-            .sort((a, b) => a.sprintNumber - b.sprintNumber);
-
-          if (historicSprints.length > 24) {
-            const sprintsToRemove = historicSprints.slice(0, historicSprints.length - 24);
-            sprintsToDelete.push(...sprintsToRemove.map(s => s.id));
-          }
-
-          // Execute all operations in a single transaction with automatic rollback on failure
-          if (statusUpdates.length > 0 || newSprints.length > 0 || sprintsToDelete.length > 0) {
-            await storage.executeSprintTransition(user.id, {
-              statusUpdates,
-              newSprints,
-              sprintsToDelete
-            });
-
-            totalSprintsProcessed += statusUpdates.length + newSprints.length + sprintsToDelete.length;
-            console.log(`Successfully processed user ${user.username}: ${statusUpdates.length} updates, ${newSprints.length} new sprints, ${sprintsToDelete.length} deletions`);
-          }
-
-          usersProcessed++;
         } catch (userError) {
-          const errorMessage = userError instanceof Error ? userError.message : "Unknown error";
-          console.error(`Transaction failed for user ${user.username}:`, userError);
-
+          const errorMessage = userError instanceof Error ? userError.message : "Unexpected error";
           failedUsers.push({
             username: user.username,
             error: errorMessage
           });
-
-          // Continue processing other users even if one fails
-          // The transaction will have automatically rolled back
+          console.error(`[SPRINT-TRANSITION] Exception processing user ${user.username}:`, userError);
         }
       }
 
-      console.log(`Sprint transition completed: ${usersProcessed} users processed, ${totalSprintsProcessed} sprint updates made`);
+      const currentSprintNumber = SprintCalculator.getCurrentSprintNumber();
+      
+      console.log(`[SPRINT-TRANSITION] Global sprint advancement completed: ${totalUsersProcessed}/${allUsers.length} users processed successfully`);
 
       if (failedUsers.length > 0) {
-        console.log(`The following users had errors: ${JSON.stringify(failedUsers)}`);
+        console.warn(`[SPRINT-TRANSITION] ${failedUsers.length} users had errors:`, failedUsers);
       }
 
       res.json({
         success: true,
         message: "Sprint transition completed",
         currentSprint: currentSprintNumber,
-        usersProcessed,
-        sprintUpdates: totalSprintsProcessed,
-        timestamp: new Date().toISOString(),
+        totalUsers: allUsers.length,
+        usersProcessed: totalUsersProcessed,
+        sprintsUpdated: totalSprintsUpdated,
         failedUsers,
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
-      console.error("Error advancing sprint:", error);
+      console.error("[SPRINT-TRANSITION] Critical error during sprint advancement:", error);
       res.status(500).json({ 
         success: false,
         message: "Failed to advance sprint",
@@ -318,6 +260,155 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
     }
   });
+
+  /**
+   * Advance sprints for a single user - idempotent sprint transition logic
+   * This function handles the complete sprint transition lifecycle for one user
+   */
+  async function advanceSprints(userId: string): Promise<{
+    success: boolean;
+    sprintsUpdated: number;
+    transitionNeeded: boolean;
+    error?: string;
+  }> {
+    try {
+      // Get current sprint calculations based on actual current date
+      const currentSprintNumber = SprintCalculator.getCurrentSprintNumber();
+      const sprintNumbers = SprintCalculator.getAllRelevantSprintNumbers();
+      
+      // Fetch all current sprint documents for the user
+      const userSprints = await storage.getUserSprints(userId);
+      
+      // Find the sprint currently marked as 'current' in the database
+      const currentSprintInDb = userSprints.find(sprint => sprint.status === 'current');
+      
+      // Determine if transition is needed by comparing sprint numbers
+      let transitionNeeded = false;
+      if (!currentSprintInDb) {
+        // No current sprint exists - transition needed
+        transitionNeeded = true;
+        console.log(`[SPRINT-TRANSITION] User ${userId}: No current sprint found - transition needed`);
+      } else if (currentSprintInDb.sprintNumber < currentSprintNumber) {
+        // Database is behind the calculated current sprint - transition needed
+        transitionNeeded = true;
+        console.log(`[SPRINT-TRANSITION] User ${userId}: Database sprint ${currentSprintInDb.sprintNumber} behind calculated sprint ${currentSprintNumber} - transition needed`);
+      } else if (currentSprintInDb.sprintNumber === currentSprintNumber) {
+        // Already up to date - check if we need to create missing sprints
+        const existingSprintNumbers = new Set(userSprints.map(s => s.sprintNumber));
+        const allRequiredSprints = [
+          ...sprintNumbers.historic,
+          sprintNumbers.current,
+          ...sprintNumbers.future
+        ];
+        const missingSprintNumbers = allRequiredSprints.filter(num => !existingSprintNumbers.has(num));
+        
+        if (missingSprintNumbers.length > 0) {
+          transitionNeeded = true;
+          console.log(`[SPRINT-TRANSITION] User ${userId}: Missing ${missingSprintNumbers.length} sprint records - creating them`);
+        } else {
+          console.log(`[SPRINT-TRANSITION] User ${userId}: Already up to date, no transition needed`);
+          return { success: true, sprintsUpdated: 0, transitionNeeded: false };
+        }
+      } else {
+        // Database is ahead of calculated current sprint - should not happen in normal operation
+        console.warn(`[SPRINT-TRANSITION] User ${userId}: Database sprint ${currentSprintInDb.sprintNumber} ahead of calculated sprint ${currentSprintNumber} - no action taken`);
+        return { success: true, sprintsUpdated: 0, transitionNeeded: false };
+      }
+
+      // If we reach here, a transition is needed
+      if (transitionNeeded) {
+        console.log(`[SPRINT-TRANSITION] User ${userId}: Executing sprint transition`);
+
+        // Prepare operations for atomic transaction
+        const operations = {
+          statusUpdates: [] as Array<{ sprintId: string; status: "historic" | "current" | "future" }>,
+          newSprints: [] as Array<{
+            sprintNumber: number;
+            startDate: Date;
+            endDate: Date;
+            type: "build" | "test" | "pto" | null;
+            description: string | null;
+            status: "historic" | "current" | "future";
+          }>,
+          sprintsToDelete: [] as string[]
+        };
+
+        // Build sprint status map for required updates
+        const existingSprintMap = new Map(userSprints.map(sprint => [sprint.sprintNumber, sprint]));
+        
+        // Collect status updates for existing sprints
+        const allRequiredSprints = [
+          ...sprintNumbers.historic,
+          sprintNumbers.current,
+          ...sprintNumbers.future
+        ];
+
+        for (const sprintNumber of allRequiredSprints) {
+          const existingSprint = existingSprintMap.get(sprintNumber);
+          const expectedStatus = SprintCalculator.getSprintStatus(sprintNumber);
+
+          if (existingSprint && existingSprint.status !== expectedStatus) {
+            operations.statusUpdates.push({
+              sprintId: existingSprint.id,
+              status: expectedStatus
+            });
+          }
+        }
+
+        // Collect new sprints to create
+        const existingSprintNumbers = new Set(userSprints.map(s => s.sprintNumber));
+        const missingSprintNumbers = allRequiredSprints.filter(num => !existingSprintNumbers.has(num));
+
+        for (const sprintNumber of missingSprintNumbers) {
+          const sprintInfo = SprintCalculator.getSprintInfo(sprintNumber);
+          operations.newSprints.push({
+            sprintNumber,
+            startDate: sprintInfo.startDate,
+            endDate: sprintInfo.endDate,
+            type: null, // New sprints start uncommitted
+            description: null,
+            status: sprintInfo.status,
+          });
+        }
+
+        // Collect old historic sprints to remove (maintain max 24 historic)
+        const historicSprints = userSprints
+          .filter(s => s.status === 'historic' || SprintCalculator.getSprintStatus(s.sprintNumber) === 'historic')
+          .sort((a, b) => a.sprintNumber - b.sprintNumber);
+
+        if (historicSprints.length > 24) {
+          const sprintsToRemove = historicSprints.slice(0, historicSprints.length - 24);
+          operations.sprintsToDelete.push(...sprintsToRemove.map(s => s.id));
+        }
+
+        // Execute all operations in a single atomic transaction
+        await storage.executeSprintTransition(userId, operations);
+
+        const totalUpdates = operations.statusUpdates.length + operations.newSprints.length + operations.sprintsToDelete.length;
+        
+        console.log(`[SPRINT-TRANSITION] User ${userId}: Transition completed - ${operations.statusUpdates.length} updates, ${operations.newSprints.length} new sprints, ${operations.sprintsToDelete.length} deletions`);
+
+        return { 
+          success: true, 
+          sprintsUpdated: totalUpdates, 
+          transitionNeeded: true 
+        };
+      }
+
+      return { success: true, sprintsUpdated: 0, transitionNeeded: false };
+
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "Unknown error";
+      console.error(`[SPRINT-TRANSITION] Error advancing sprints for user ${userId}:`, error);
+      
+      return { 
+        success: false, 
+        sprintsUpdated: 0, 
+        transitionNeeded: false, 
+        error: errorMessage 
+      };
+    }
+  }
 
   // Send dashboard completion webhook
   app.post("/api/dashboard/:username/complete", async (req, res) => {
