@@ -2152,6 +2152,10 @@ interface ValidationCheckResult {
   recommendations: string[];
   metrics: Record<string, any>;
 }
+    /**
+   * Comprehensive error analysis and recovery strategy determination
+   */
+  private analyzeErrorAndDetermineStrategy(error: Error, context: OperationContext): ErrorRecoveryStrategy {
     const errorMessage = error.message.toLowerCase();
     
     // Database constraint violations - non-recoverable
