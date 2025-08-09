@@ -4,12 +4,14 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
+    "build": "tsc && vite build",
     "dev": "NODE_ENV=development tsx server/index.ts",
-    "build": "tsc",
-    "start": "node dist/server/index.js",
-    "test": "jest",
-    "test:watch": "jest --watch",
-    "test:coverage": "jest --coverage"
+    "preview": "vite preview",
+    "migrate": "drizzle-kit migrate",
+    "generate": "drizzle-kit generate",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
@@ -91,7 +93,8 @@
     "ts-jest": "^29.4.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
-    "vite": "^5.4.19"
+    "vite": "^5.4.19",
+    "vitest": "^2.0.4"
   },
   "optionalDependencies": {
     "bufferutil": "^4.0.8"
