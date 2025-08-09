@@ -74,6 +74,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const currentSprint = await storage.getSprintsByStatus(user.id, "current").then(sprints => sprints[0]);
       const futureSprints = await storage.getSprintsByStatus(user.id, "future");
 
+      // Self-healing: Verify sprint cycles are current and advance if needed
+      console.log(`[SELF-HEALING] Verifying sprint cycles for user ${user.username}`);
+      const healingResult = await advanceSprints(user.id);
+      
+      if (healingResult.transitionNeeded) {
+        console.log(`[SELF-HEALING] Sprint transition performed for user ${user.username}: ${healingResult.sprintsUpdated} sprints updated`);
+        
+        // Re-fetch data after potential sprint advancement
+        const updatedHistoricSprints = await storage.getSprintsByStatus(user.id, "historic");
+        const updatedCurrentSprint = await storage.getSprintsByStatus(user.id, "current").then(sprints => sprints[0]);
+        const updatedFutureSprints = await storage.getSprintsByStatus(user.id, "future");
+        
+        // Update our working data with the corrected sprint information
+        historicSprints.splice(0, historicSprints.length, ...updatedHistoricSprints);
+        Object.assign(currentSprint, updatedCurrentSprint);
+        futureSprints.splice(0, futureSprints.length, ...updatedFutureSprints);
+      } else {
+        console.log(`[SELF-HEALING] Sprint cycles already current for user ${user.username}`);
+      }
+
       // Calculate stats for validation
       const futureCommittedSprints = futureSprints.filter(s => s.type);
       const buildCount = futureCommittedSprints.filter(s => s.type === "build").length;
