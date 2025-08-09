@@ -11,6 +11,14 @@ import { sendWebhook } from "./utils/webhookService";
 
 export async function registerRoutes(app: Express): Promise<Server> {
 
+  // Health check endpoint
+  app.get("/health", (req, res) => {
+    res.status(200).json({
+      status: "ok",
+      timestamp: new Date().toISOString()
+    });
+  });
+
   // Mount the dashboard completion webhook router
   app.use('/api/dashboard-complete', completionRouter);
 
