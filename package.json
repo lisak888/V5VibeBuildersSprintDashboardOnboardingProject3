@@ -10,8 +10,10 @@
     "migrate": "drizzle-kit migrate",
     "generate": "drizzle-kit generate",
     "test": "vitest",
+    "test:ui": "vitest --ui",
     "test:run": "vitest run",
-    "test:coverage": "vitest run --coverage"
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",

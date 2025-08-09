@@ -1,4 +1,3 @@
-
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
@@ -105,7 +104,7 @@ export default function Dashboard() {
     setCommitments(prev => {
       const newCommitments = new Map(prev);
       const existing = newCommitments.get(sprintId) || { sprintId, type: null };
-      
+
       if (field === 'type') {
         existing.type = value as 'build' | 'test' | 'pto' | null;
         // Clear description if not a build sprint
@@ -115,12 +114,12 @@ export default function Dashboard() {
       } else if (field === 'description') {
         existing.description = value || undefined;
       }
-      
+
       newCommitments.set(sprintId, existing);
-      
+
       // Validate in real-time
       validateCommitments(newCommitments);
-      
+
       return newCommitments;
     });
   };
@@ -131,14 +130,14 @@ export default function Dashboard() {
     const values = Array.from(currentCommitments.values());
     const buildCount = values.filter(c => c.type === 'build').length;
     const ptoCount = values.filter(c => c.type === 'pto').length;
-    
+
     if (ptoCount > 2) {
       errors.push('Maximum 2 PTO sprints allowed per 6-sprint window');
     }
     if (buildCount < 2) {
       errors.push('Minimum 2 Build sprints required per 6-sprint window');
     }
-    
+
     // Check for Build sprints without descriptions
     const buildWithoutDescription = values.filter(c => 
       c.type === 'build' && (!c.description || c.description.trim() === '')
@@ -146,7 +145,7 @@ export default function Dashboard() {
     if (buildWithoutDescription.length > 0) {
       errors.push('All Build sprints require a description');
     }
-    
+
     setValidationErrors(errors);
   };
 
@@ -326,7 +325,7 @@ export default function Dashboard() {
                 </div>
                 <p className="text-sm text-gray-600 mt-1">Completed sprint commitments</p>
               </CardHeader>
-              
+
               <CardContent className="p-6">
                 <div className="space-y-4">
                   {data.sprints.historic.length > 0 ? (
@@ -369,7 +368,7 @@ export default function Dashboard() {
                 </div>
                 <p className="text-sm text-gray-600 mt-1">Active sprint commitment</p>
               </CardHeader>
-              
+
               <CardContent className="p-6">
                 {data.sprints.current ? (
                   <div className={`border-l-4 rounded-r-lg p-4 ${
@@ -414,6 +413,7 @@ export default function Dashboard() {
                       disabled={validationErrors.length > 0 || saveCommitmentsMutation.isPending}
                       size="sm"
                       className="ml-2"
+                      data-testid="save-commitments-btn"
                     >
                       {saveCommitmentsMutation.isPending ? 'Saving...' : 'Save Changes'}
                     </Button>
@@ -421,7 +421,7 @@ export default function Dashboard() {
                 </div>
                 <p className="text-sm text-gray-600 mt-1">Plan your upcoming sprint commitments</p>
               </CardHeader>
-              
+
               <CardContent className="p-6">
                 <div className="space-y-6">
                   {data.sprints.future.map((sprint, index) => {
@@ -439,7 +439,7 @@ export default function Dashboard() {
                             {index === 0 ? 'Next' : `+${(index + 1) * 2} weeks`}
                           </Badge>
                         </div>
-                        
+
                         <div className="space-y-3">
                           <div>
                             <label className="text-xs font-medium text-gray-600 uppercase tracking-wide">Sprint Type</label>
@@ -457,7 +457,7 @@ export default function Dashboard() {
                               </SelectContent>
                             </Select>
                           </div>
-                          
+
                           <div className={currentType === 'build' ? '' : 'opacity-50'}>
                             <label className="text-xs font-medium text-gray-600 uppercase tracking-wide">Description</label>
                             <Textarea
@@ -492,6 +492,7 @@ export default function Dashboard() {
                         onClick={handleSaveCommitments}
                         disabled={validationErrors.length > 0 || saveCommitmentsMutation.isPending}
                         size="sm"
+                        data-testid="save-commitments-btn"
                       >
                         {saveCommitmentsMutation.isPending ? 'Saving...' : 'Save All Changes'}
                       </Button>
