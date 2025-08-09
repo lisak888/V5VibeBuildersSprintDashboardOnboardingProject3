@@ -2110,7 +2110,20 @@ export class DatabaseStorage implements IStorage {
   // ===== ROLLBACK AND ERROR RECOVERY LOGIC =====
   // Phase 5 Task 9: Add rollback and error recovery logic
 
+  /**
+   * Error classification and recovery strategy interface
+   */
+  private analyzeErrorAndDetermineStrategy(error: Error, context: OperationContext): ErrorRecoveryStrategy {
+    // This method will be implemented but for now return a basic strategy
+    return {
+      shouldRetry: true,
+      retryDelay: 1000,
+      maxRetries: 1,
+      requiresRollback: true,
+      requiresDataValidation: true
+    };
   }
+}
 
 /**
  * Error classification and recovery strategy interface
