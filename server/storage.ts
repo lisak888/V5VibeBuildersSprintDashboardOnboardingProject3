@@ -2110,53 +2110,48 @@ export class DatabaseStorage implements IStorage {
   // ===== ROLLBACK AND ERROR RECOVERY LOGIC =====
   // Phase 5 Task 9: Add rollback and error recovery logic
 
-  /**
-   * Error classification and recovery strategy interface
-   */
-  private analyzeErrorAndDetermineStrategy(error: Error, context: OperationContext): ErrorRecoveryStrategy {
-    // This method will be implemented but for now return a basic strategy
-    return {
-      shouldRetry: true,
-      retryDelay: 1000,
-      maxRetries: 1,
-      requiresRollback: true,
-      requiresDataValidation: true
-    };
-  }
 }
 
 /**
  * Error classification and recovery strategy interface
  */
 interface ErrorRecoveryStrategy {
-    shouldRetry: boolean;
-    retryDelay: number;
-    maxRetries: number;
-    requiresRollback: boolean;
-    requiresDataValidation: boolean;
-    customRecovery?: () => Promise<boolean>;
-  }
+  shouldRetry: boolean;
+  retryDelay: number;
+  maxRetries: number;
+  requiresRollback: boolean;
+  requiresDataValidation: boolean;
+  customRecovery?: () => Promise<boolean>;
+}
 
-  /**
+/**
  * Operation context for comprehensive error tracking
  */
 interface OperationContext {
-    operationType: 'sprint_advancement' | 'commitment_update' | 'bulk_operation' | 'data_migration';
-    userId?: string;
-    operationId: string;
-    startTime: Date;
-    checkpoints: Array<{
-      timestamp: Date;
-      operation: string;
-      data: any;
-    }>;
-    rollbackData?: any;
-  }
+  operationType: 'sprint_advancement' | 'commitment_update' | 'bulk_operation' | 'data_migration';
+  userId?: string;
+  operationId: string;
+  startTime: Date;
+  checkpoints: Array<{
+    timestamp: Date;
+    operation: string;
+    data: any;
+  }>;
+  rollbackData?: any;
+}
 
-  /**
-   * Comprehensive error analysis and recovery strategy determination
-   */
-  private analyzeErrorAndDetermineStrategy(error: Error, context: OperationContext): ErrorRecoveryStrategy {
+/**
+ * Validation check result interface
+ */
+interface ValidationCheckResult {
+  checkName: string;
+  passed: boolean;
+  score: number; // 0-100 percentage score
+  errors: string[];
+  warnings: string[];
+  recommendations: string[];
+  metrics: Record<string, any>;
+}
     const errorMessage = error.message.toLowerCase();
     
     // Database constraint violations - non-recoverable
