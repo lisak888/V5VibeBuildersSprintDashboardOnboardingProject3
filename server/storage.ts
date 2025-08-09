@@ -289,7 +289,7 @@ export class DatabaseStorage implements IStorage {
             if (isolationLevel !== 'read committed') {
               await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL ${sql.raw(isolationLevel.toUpperCase())}`);
             }
-            
+
             return await fn(tx);
           }),
           new Promise<never>((_, reject) => 
@@ -298,7 +298,7 @@ export class DatabaseStorage implements IStorage {
         ]);
 
         const duration = Date.now() - startTime;
-        
+
         if (logQueries) {
           console.log(`[TRANSACTION] Completed successfully in ${duration}ms after ${retryCount} retries`);
         }
@@ -330,7 +330,7 @@ export class DatabaseStorage implements IStorage {
     }
 
     const duration = Date.now() - startTime;
-    
+
     if (logQueries) {
       console.error(`[TRANSACTION] Failed after ${retries + 1} attempts in ${duration}ms: ${lastError?.message}`);
     }
@@ -365,18 +365,18 @@ export class DatabaseStorage implements IStorage {
    * Simplified transaction method for backward compatibility
    * Uses default options for common operations
    */
-  async executeSimpleTransaction<T>(fn: TransactionFn<T>): Promise<T> {
+  async executeSimpleTransaction<T>( fn: TransactionFn<T>): Promise<T> {
     const result = await this.executeTransaction(fn, { retries: 1, logQueries: false });
-    
+
     if (!result.success) {
       throw result.error || new Error('Transaction failed');
     }
-    
+
     return result.data!;
   }
 
   // Efficient query methods for dashboard operations
-  
+
   /**
    * Get complete dashboard data in a single optimized query
    * Uses joins to reduce database round trips
@@ -428,7 +428,7 @@ export class DatabaseStorage implements IStorage {
    */
   async getFutureSprintsWithCommitments(userId: string): Promise<Array<Sprint & { hasCommitment: boolean }>> {
     const futureSprints = await this.getSprintsByStatus(userId, "future");
-    
+
     // Get commitment status in single query
     const commitmentMap = new Map();
     if (futureSprints.length > 0) {
@@ -442,7 +442,7 @@ export class DatabaseStorage implements IStorage {
             inArray(sprintCommitments.sprintId, sprintIds)
           )
         );
-      
+
       commitments.forEach(c => commitmentMap.set(c.sprintId, true));
     }
 
@@ -849,7 +849,7 @@ export class DatabaseStorage implements IStorage {
    */
   async testTransactionHealth(): Promise<{ healthy: boolean; latency: number; error?: string }> {
     const startTime = Date.now();
-    
+
     try {
       const result = await this.executeTransaction(async (tx) => {
         // Simple test query
@@ -919,7 +919,7 @@ export class DatabaseStorage implements IStorage {
     } = options;
 
     const lockId = `${operationType}_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
-    
+
     if (!this.lockManager.has(resourceId)) {
       this.lockManager.set(resourceId, {
         queue: [],
@@ -1003,7 +1003,7 @@ export class DatabaseStorage implements IStorage {
     // Process next in queue
     if (lockInfo.queue.length > 0) {
       const nextWaiter = lockInfo.queue.shift()!;
-      
+
       lockInfo.isLocked = true;
       const nextLockId = `${nextWaiter.operationType}_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
       lockInfo.lockHolder = nextLockId;
@@ -1049,7 +1049,7 @@ export class DatabaseStorage implements IStorage {
     // If under limit, acquire immediately
     if (semaphore.current < semaphore.max) {
       semaphore.current++;
-      
+
       return {
         release: () => {
           semaphore.current--;
@@ -1126,7 +1126,7 @@ export class DatabaseStorage implements IStorage {
     } = {}
   ): Promise<T> {
     const lock = await this.acquireExclusiveLock(resourceId, operationType, options);
-    
+
     try {
       return await operation();
     } finally {
@@ -1148,7 +1148,7 @@ export class DatabaseStorage implements IStorage {
     } = {}
   ): Promise<T> {
     const semaphore = await this.acquireSemaphore(operationType, maxConcurrent, options);
-    
+
     try {
       return await operation();
     } finally {
@@ -1364,11 +1364,11 @@ export class DatabaseStorage implements IStorage {
     // Process operations in batches
     for (let i = 0; i < operations.length; i += batchSize) {
       const batch = operations.slice(i, i + batchSize);
-      
+
       // Execute batch with controlled concurrency
       const batchPromises = batch.map(async (op) => {
         const startTime = Date.now();
-        
+
         try {
           // Deadlock prevention check
           if (deadlockPrevention && op.resourceDependencies) {
@@ -1602,7 +1602,7 @@ export class DatabaseStorage implements IStorage {
       // Check 1: Sprint count validation
       totalChecks++;
       const sprintCounts = await this.getSprintCountsByStatus(userId);
-      
+
       if (sprintCounts.current !== 1) {
         errors.push(`Expected exactly 1 current sprint, found ${sprintCounts.current}`);
       } else {
@@ -2115,7 +2115,7 @@ export class DatabaseStorage implements IStorage {
    */
   private analyzeErrorAndDetermineStrategy(error: Error, context: OperationContext): ErrorRecoveryStrategy {
     const errorMessage = error.message.toLowerCase();
-    
+
     // Database constraint violations - non-recoverable
     if (this.isConstraintViolation(error)) {
       return {
@@ -2305,14 +2305,14 @@ export class DatabaseStorage implements IStorage {
         break; // Transaction wrapper handles its own retries
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
-        
+
         if (!enableRecovery) {
           break;
         }
 
         // Analyze error and determine recovery strategy
         const strategy = this.analyzeErrorAndDetermineStrategy(lastError, context);
-        
+
         console.warn(`[RECOVERY] Attempt ${recoveryAttempts + 1} failed for ${operationId}: ${lastError.message}`);
 
         // Perform rollback if required
@@ -2343,7 +2343,7 @@ export class DatabaseStorage implements IStorage {
 
     // All recovery attempts failed
     const duration = Date.now() - startTime;
-    
+
     console.error(`[RECOVERY] All recovery attempts failed for ${operationId} after ${duration}ms:`, lastError?.message);
 
     return {
@@ -2367,17 +2367,17 @@ export class DatabaseStorage implements IStorage {
     switch (operationType) {
       case 'sprint_advancement':
         return await this.createSprintAdvancementBackup(userId);
-      
+
       case 'commitment_update':
         // Get current sprint commitments state
         const sprints = await this.getUserSprints(userId);
         const commitments = await this.getSprintCommitments(userId);
         return { sprints, commitments };
-      
+
       case 'bulk_operation':
         // Create comprehensive backup
         return await this.createComprehensiveBackup(userId);
-      
+
       default:
         return null;
     }
@@ -2402,13 +2402,13 @@ export class DatabaseStorage implements IStorage {
       switch (operationType) {
         case 'sprint_advancement':
           return await this.performSprintAdvancementRollback(tx, userId, backupData);
-        
+
         case 'commitment_update':
           return await this.performCommitmentUpdateRollback(tx, userId, backupData);
-        
+
         case 'bulk_operation':
           return await this.performBulkOperationRollback(tx, userId, backupData);
-        
+
         default:
           throw new Error(`Rollback not implemented for operation type: ${operationType}`);
       }
@@ -2534,13 +2534,13 @@ export class DatabaseStorage implements IStorage {
         case 'sprint_advancement':
           const sprintIntegrity = await this.verifySprintAdvancementIntegrity(userId);
           return sprintIntegrity.isValid;
-        
+
         case 'commitment_update':
           return await this.validateCommitmentUpdateResult(userId);
-        
+
         case 'bulk_operation':
           return await this.validateBulkOperationResult(userId);
-        
+
         default:
           return true; // No validation implemented
       }
@@ -2581,7 +2581,7 @@ export class DatabaseStorage implements IStorage {
   private async validateBulkOperationResult(userId: string): Promise<boolean> {
     const sprintValidation = await this.validateCommitmentUpdateResult(userId);
     const integrityCheck = await this.verifySprintAdvancementIntegrity(userId);
-    
+
     return sprintValidation && integrityCheck.isValid;
   }
 
@@ -2874,7 +2874,7 @@ export class DatabaseStorage implements IStorage {
     };
   }> {
     const startTime = Date.now();
-    
+
     // Convert user operations to batch operations format
     const batchOperations = userOperations.map(userOp => ({
       id: userOp.userId,
@@ -2973,7 +2973,7 @@ export class DatabaseStorage implements IStorage {
       .select()
       .from(sprints)
       .where(eq(sprints.userId, userId))
-      .for('update');
+      .for('update'); // Prevent concurrent modifications
 
     const existingSprintMap = new Map(
       existingSprints.map((sprint: any) => [sprint.sprintNumber, sprint])
@@ -2982,7 +2982,7 @@ export class DatabaseStorage implements IStorage {
     // Update sprint statuses
     for (const [sprintNumber, newStatus] of operations.sprintStatusMap.entries()) {
       const existingSprint = existingSprintMap.get(sprintNumber);
-      
+
       if (existingSprint && existingSprint.status !== newStatus) {
         await tx
           .update(sprints)
@@ -2991,7 +2991,7 @@ export class DatabaseStorage implements IStorage {
             updatedAt: new Date() 
           })
           .where(eq(sprints.id, existingSprint.id));
-        
+
         sprintsUpdated++;
       }
     }
@@ -3010,7 +3010,7 @@ export class DatabaseStorage implements IStorage {
             description: null,
             status: newSprint.status,
           });
-        
+
         sprintsCreated++;
       }
     }
@@ -3018,12 +3018,12 @@ export class DatabaseStorage implements IStorage {
     // Clean up old sprints
     for (const sprintNumber of operations.sprintsToCleanup) {
       const sprintToDelete = existingSprintMap.get(sprintNumber);
-      
+
       if (sprintToDelete) {
         await tx.delete(sprintCommitments).where(eq(sprintCommitments.sprintId, sprintToDelete.id));
         await tx.delete(webhookLogs).where(eq(webhookLogs.sprintId, sprintToDelete.id));
         await tx.delete(sprints).where(eq(sprints.id, sprintToDelete.id));
-        
+
         sprintsDeleted++;
       }
     }
@@ -3088,7 +3088,7 @@ export class DatabaseStorage implements IStorage {
       // Step 2: Update sprint statuses atomically
       for (const [sprintNumber, newStatus] of operations.sprintStatusMap.entries()) {
         const existingSprint = existingSprintMap.get(sprintNumber);
-        
+
         if (existingSprint && existingSprint.status !== newStatus) {
           await tx
             .update(sprints)
@@ -3097,7 +3097,7 @@ export class DatabaseStorage implements IStorage {
               updatedAt: new Date() 
             })
             .where(eq(sprints.id, existingSprint.id));
-          
+
           sprintsUpdated++;
         }
       }
@@ -3116,7 +3116,7 @@ export class DatabaseStorage implements IStorage {
               description: null,
               status: newSprint.status,
             });
-          
+
           sprintsCreated++;
         }
       }
@@ -3124,7 +3124,7 @@ export class DatabaseStorage implements IStorage {
       // Step 4: Clean up old historic sprints atomically
       for (const sprintNumber of operations.sprintsToCleanup) {
         const sprintToDelete = existingSprintMap.get(sprintNumber);
-        
+
         if (sprintToDelete) {
           // Delete related sprint commitments first (cascade)
           await tx
@@ -3140,7 +3140,7 @@ export class DatabaseStorage implements IStorage {
           await tx
             .delete(sprints)
             .where(eq(sprints.id, sprintToDelete.id));
-          
+
           sprintsDeleted++;
         }
       }
@@ -3463,7 +3463,7 @@ export class DatabaseStorage implements IStorage {
         })
         .from(sprints)
         .where(eq(sprints.userId, userId)),
-      
+
       db
         .select({
           id: sprintCommitments.id,
@@ -3954,8 +3954,6 @@ interface ValidationCheckResult {
   warnings: string[];
   recommendations: string[];
   metrics: Record<string, any>;
-}
-
 }
 
 /**
