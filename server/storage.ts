@@ -365,7 +365,7 @@ export class DatabaseStorage implements IStorage {
    * Simplified transaction method for backward compatibility
    * Uses default options for common operations
    */
-  async executeSimpleTransaction<T>( fn: TransactionFn<T>): Promise<T> {
+  async executeSimpleTransaction<T>(fn: TransactionFn<T>): Promise<T> {
     const result = await this.executeTransaction(fn, { retries: 1, logQueries: false });
 
     if (!result.success) {
