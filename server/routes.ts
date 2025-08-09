@@ -6,8 +6,12 @@ import { WebhookService } from "./services/webhookService";
 import { StateChangeDetector } from "./services/stateChangeDetector";
 import { updateSprintCommitmentsSchema } from "@shared/schema";
 import { z } from "zod";
+import completionRouter from "./routes/completion";
 
 export async function registerRoutes(app: Express): Promise<Server> {
+  
+  // Mount the dashboard completion webhook router
+  app.use('/api/dashboard-complete', completionRouter);
 
   // Get dashboard data for a user
   app.get("/api/dashboard/:username", async (req, res) => {
